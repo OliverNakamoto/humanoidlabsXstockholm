@@ -106,7 +106,8 @@ def teleop_loop(
     start = time.perf_counter()
     while True:
         loop_start = time.perf_counter()
-        action = teleop.get_action()
+        current_pos = robot.get_pos()
+        action = teleop.get_action(current_pos) #current pos is only used for hand leader, not so101!
         if display_data:
             observation = robot.get_observation()
             log_rerun_data(observation, action)
