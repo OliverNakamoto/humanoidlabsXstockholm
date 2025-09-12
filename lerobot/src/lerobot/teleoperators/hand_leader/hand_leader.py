@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from lerobot.src.lerobot.model.kinematics import RobotKinematics
+
 import logging
 import time
 
@@ -28,6 +30,11 @@ from ..teleoperator import Teleoperator
 from .config_hand_leader import HandLeaderConfig
 
 logger = logging.getLogger(__name__)
+
+
+#added since the get actions function in normal class uses sync from motors
+from typing import Protocol, Tuple, TypeAlias
+Value: TypeAlias = int | float
 
 
 class HandLeader(Teleoperator):
@@ -54,6 +61,12 @@ class HandLeader(Teleoperator):
             },
             calibration=self.calibration,
         )
+
+    
+    self.kinematics = RobotKinematics(
+        urdf_path=env.unwrapped.robot.config.urdf_path,
+        target_frame_name=env.unwrapped.robot.config.target_frame_name,
+    )
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -136,8 +149,32 @@ class HandLeader(Teleoperator):
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
 
-    def get_action(self) -> dict[str, float]:
+    def get_endpos(sefl) -> Tuple:
+        #talk to the mediapipe code and get the size of the palm bounding box and the claw percentage
+
+        #implement this as a dict is super slow no? just a tuple is better or what is best for speed.
+        HandPos = mediapipe.get_current()
+
+        return HandPos[0], HandPos[1]
+    
+    def IK(self, positions) -> dict[str, Value]:
+        current_pos, end_effector_pos, claw_percentage = positions
+
+        joints = self.kinematics.inverse_kinematics(current_pos, end_effector_pos)
+
+        #combine joints and claw percentage into one dict
+        actions = {f"{motor}.pos": val for motor, val in zip(self.bus.motors.keys(), joints)} #im not using any bus shit here, i am using coordinates from a cv model of a hand. +
+        actions["gripper.pos"] = claw_percentage
+
+        return actions #this is used in normal class:  return {self._id_to_name(id_): value for id_, value in ids_values.items()}
+
+
+
+
+    def get_action(self, current_pos) -> dict[str, float]:
         start = time.perf_counter()
+        hand_pos = current_pos, self.get_endpos()
+        action = self.IK(hand_pos)
         action = self.bus.sync_read("Present_Position")
         action = {f"{motor}.pos": val for motor, val in action.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
