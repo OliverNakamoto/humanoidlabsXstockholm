@@ -36,7 +36,7 @@ class HandLeader(Teleoperator):
     """
 
     config_class = HandLeaderConfig
-    name = "so101_leader"
+    name = "hand_leader"
 
     def __init__(self, config: HandLeaderConfig):
         super().__init__(config)
