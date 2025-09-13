@@ -83,6 +83,203 @@ class MediaPipeHandTracker:
         self.current_data = HandTrackingData.create_default()
         self.frame_count = 0
         
+        # Orientation tracking
+        self.neutral_orientation = None  # Neutral quaternion from calibration
+        self.prev_euler = np.array([0.0, 0.0, 0.0])  # Previous Euler angles for EMA smoothing
+        self.orientation_ema_alpha = 0.3  # EMA smoothing factor (lower = more smoothing)
+    
+    @staticmethod
+    def _build_orthonormal_basis(wrist, index_mcp, pinky_mcp):
+        """Build orthonormal basis from 3 hand landmarks.
+        
+        Args:
+            wrist, index_mcp, pinky_mcp: 3D points as numpy arrays
+            
+        Returns:
+            3x3 rotation matrix as numpy array
+        """
+        # Vector from wrist to index MCP (forward direction)
+        forward = index_mcp - wrist
+        forward = forward / np.linalg.norm(forward)
+        
+        # Vector from index MCP to pinky MCP (side direction)
+        side_raw = pinky_mcp - index_mcp
+        
+        # Make side orthogonal to forward using Gram-Schmidt
+        side = side_raw - np.dot(side_raw, forward) * forward
+        side = side / np.linalg.norm(side)
+        
+        # Up direction (cross product)
+        up = np.cross(forward, side)
+        up = up / np.linalg.norm(up)
+        
+        # Build rotation matrix [right, up, forward] (or adjust axes as needed)
+        rotation_matrix = np.column_stack([side, up, forward])
+        return rotation_matrix
+    
+    @staticmethod
+    def _rotation_matrix_to_quaternion(R):
+        """Convert rotation matrix to quaternion.
+        
+        Args:
+            R: 3x3 rotation matrix
+            
+        Returns:
+            Quaternion as (x, y, z, w)
+        """
+        trace = np.trace(R)
+        
+        if trace > 0:
+            s = np.sqrt(trace + 1.0) * 2  # s = 4 * qw
+            qw = 0.25 * s
+            qx = (R[2, 1] - R[1, 2]) / s
+            qy = (R[0, 2] - R[2, 0]) / s
+            qz = (R[1, 0] - R[0, 1]) / s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2  # s = 4 * qx
+            qw = (R[2, 1] - R[1, 2]) / s
+            qx = 0.25 * s
+            qy = (R[0, 1] + R[1, 0]) / s
+            qz = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2  # s = 4 * qy
+            qw = (R[0, 2] - R[2, 0]) / s
+            qx = (R[0, 1] + R[1, 0]) / s
+            qy = 0.25 * s
+            qz = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2  # s = 4 * qz
+            qw = (R[1, 0] - R[0, 1]) / s
+            qx = (R[0, 2] + R[2, 0]) / s
+            qy = (R[1, 2] + R[2, 1]) / s
+            qz = 0.25 * s
+        
+        return np.array([qx, qy, qz, qw])
+    
+    @staticmethod
+    def _quaternion_to_euler(q):
+        """Convert quaternion to Euler angles (roll, pitch, yaw).
+        
+        Args:
+            q: Quaternion as [qx, qy, qz, qw]
+            
+        Returns:
+            Euler angles as [roll, pitch, yaw] in radians
+        """
+        qx, qy, qz, qw = q
+        
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (qw * qx + qy * qz)
+        cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+        
+        # Pitch (y-axis rotation)
+        sinp = 2 * (qw * qy - qz * qx)
+        if abs(sinp) >= 1:
+            pitch = np.copysign(np.pi / 2, sinp)  # Use 90 degrees if out of range
+        else:
+            pitch = np.arcsin(sinp)
+        
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (qw * qz + qx * qy)
+        cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+        
+        return np.array([roll, pitch, yaw])
+    
+    @staticmethod
+    def _euler_to_quaternion(euler):
+        """Convert Euler angles to quaternion.
+        
+        Args:
+            euler: Euler angles as [roll, pitch, yaw] in radians
+            
+        Returns:
+            Quaternion as [qx, qy, qz, qw]
+        """
+        roll, pitch, yaw = euler
+        
+        cy = np.cos(yaw * 0.5)
+        sy = np.sin(yaw * 0.5)
+        cp = np.cos(pitch * 0.5)
+        sp = np.sin(pitch * 0.5)
+        cr = np.cos(roll * 0.5)
+        sr = np.sin(roll * 0.5)
+        
+        qw = cr * cp * cy + sr * sp * sy
+        qx = sr * cp * cy - cr * sp * sy
+        qy = cr * sp * cy + sr * cp * sy
+        qz = cr * cp * sy - sr * sp * cy
+        
+        return np.array([qx, qy, qz, qw])
+    
+    def _calculate_hand_orientation(self, landmarks, frame_width, frame_height):
+        """Calculate hand orientation from landmarks.
+        
+        Args:
+            landmarks: MediaPipe hand landmarks
+            frame_width, frame_height: Frame dimensions
+            
+        Returns:
+            Smoothed quaternion as [qx, qy, qz, qw]
+        """
+        # Extract key landmarks (wrist, index MCP, pinky MCP)
+        wrist = landmarks.landmark[0]  # Wrist
+        index_mcp = landmarks.landmark[5]  # Index MCP
+        pinky_mcp = landmarks.landmark[17]  # Pinky MCP
+        
+        # Convert to 3D coordinates (using MediaPipe's z coordinate)
+        wrist_3d = np.array([wrist.x * frame_width, wrist.y * frame_height, wrist.z * frame_width])
+        index_mcp_3d = np.array([index_mcp.x * frame_width, index_mcp.y * frame_height, index_mcp.z * frame_width])
+        pinky_mcp_3d = np.array([pinky_mcp.x * frame_width, pinky_mcp.y * frame_height, pinky_mcp.z * frame_width])
+        
+        # Build orthonormal basis
+        rotation_matrix = self._build_orthonormal_basis(wrist_3d, index_mcp_3d, pinky_mcp_3d)
+        
+        # Convert to quaternion
+        quaternion = self._rotation_matrix_to_quaternion(rotation_matrix)
+        
+        # Apply camera-to-robot coordinate transformation
+        # This mapping may need adjustment based on your camera setup
+        # Example: flip Y and Z axes for typical camera mounting
+        qx, qy, qz, qw = quaternion
+        robot_quaternion = np.array([qx, -qz, -qy, qw])  # Example mapping
+        
+        # Convert to Euler for smoothing
+        euler = self._quaternion_to_euler(robot_quaternion)
+        
+        # Apply EMA smoothing
+        self.prev_euler = self.orientation_ema_alpha * euler + (1 - self.orientation_ema_alpha) * self.prev_euler
+        
+        # Convert smoothed Euler back to quaternion
+        smoothed_quaternion = self._euler_to_quaternion(self.prev_euler)
+        
+        # Apply neutral orientation offset if calibrated
+        if self.neutral_orientation is not None:
+            # Subtract neutral orientation (quaternion multiplication)
+            smoothed_quaternion = self._quaternion_multiply(smoothed_quaternion, self._quaternion_conjugate(self.neutral_orientation))
+        
+        return smoothed_quaternion
+    
+    @staticmethod
+    def _quaternion_multiply(q1, q2):
+        """Multiply two quaternions."""
+        x1, y1, z1, w1 = q1
+        x2, y2, z2, w2 = q2
+        
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        
+        return np.array([x, y, z, w])
+    
+    @staticmethod
+    def _quaternion_conjugate(q):
+        """Get quaternion conjugate."""
+        qx, qy, qz, qw = q
+        return np.array([-qx, -qy, -qz, qw])
+        
     def initialize(self) -> bool:
         """Initialize camera and MediaPipe."""
         try:
@@ -148,6 +345,9 @@ class MediaPipeHandTracker:
             
             self.palm_bbox_near = near_data['palm_bbox_size']
             near_thumb_index = near_data['thumb_index_dist']
+            # Capture neutral orientation from near position
+            if 'neutral_quaternion' in near_data:
+                self.neutral_orientation = near_data['neutral_quaternion']
             
             # Use average of far and near thumb-index distance for normalization
             self.initial_thumb_index_dist = (far_thumb_index + near_thumb_index) / 2
@@ -159,6 +359,9 @@ class MediaPipeHandTracker:
             print(f"Far bbox size: {self.palm_bbox_far:.1f}")
             print(f"Near bbox size: {self.palm_bbox_near:.1f}")
             print(f"Initial thumb-index distance: {self.initial_thumb_index_dist:.1f}")
+            if self.neutral_orientation is not None:
+                qx, qy, qz, qw = self.neutral_orientation
+                print(f"Neutral orientation (quat): [{qx:.3f}, {qy:.3f}, {qz:.3f}, {qw:.3f}]")
             print("="*50 + "\n")
             
             return True
@@ -220,9 +423,18 @@ class MediaPipeHandTracker:
                     (thumb_tip.y - index_tip.y)**2
                 ) * w  # Convert to pixels
                 
+                # Calculate orientation quaternion for calibration snapshot
+                try:
+                    q_cal = self._calculate_hand_orientation(landmarks, w, h)
+                    qx, qy, qz, qw = float(q_cal[0]), float(q_cal[1]), float(q_cal[2]), float(q_cal[3])
+                except Exception as e:
+                    logger.debug(f"Calibration orientation calculation failed: {e}")
+                    qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+                
                 samples.append({
                     'palm_bbox_size': palm_data['palm_width'],
-                    'thumb_index_dist': thumb_index_dist
+                    'thumb_index_dist': thumb_index_dist,
+                    'quat': (qx, qy, qz, qw)
                 })
                 
                 # Show captured frame
@@ -246,10 +458,22 @@ class MediaPipeHandTracker:
         # Average the samples
         avg_bbox_size = np.mean([s['palm_bbox_size'] for s in samples])
         avg_thumb_index = np.mean([s['thumb_index_dist'] for s in samples])
+        # Average quaternion components then renormalize
+        quats = np.array([s['quat'] for s in samples if 'quat' in s])
+        if len(quats) > 0:
+            avg_quat = np.mean(quats, axis=0)
+            norm = np.linalg.norm(avg_quat)
+            if norm > 0:
+                avg_quat = avg_quat / norm
+            else:
+                avg_quat = np.array([0.0, 0.0, 0.0, 1.0])
+        else:
+            avg_quat = np.array([0.0, 0.0, 0.0, 1.0])
         
         return {
-            'palm_bbox_size': avg_bbox_size,
-            'thumb_index_dist': avg_thumb_index
+            'palm_bbox_size': float(avg_bbox_size),
+            'thumb_index_dist': float(avg_thumb_index),
+            'neutral_quaternion': avg_quat
         }
     
     def _calculate_palm_bbox(self, landmarks, frame_width, frame_height):
@@ -347,6 +571,14 @@ class MediaPipeHandTracker:
             y = self.workspace_bounds['y_min'] + norm_y * (self.workspace_bounds['y_max'] - self.workspace_bounds['y_min'])
             z = self.workspace_bounds['z_min'] + norm_z * (self.workspace_bounds['z_max'] - self.workspace_bounds['z_min'])
             
+            # Calculate hand orientation
+            try:
+                orientation_quat = self._calculate_hand_orientation(landmarks, w, h)
+                qx, qy, qz, qw = orientation_quat
+            except Exception as e:
+                logger.warning(f"Failed to calculate orientation: {e}")
+                qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0  # Identity quaternion
+            
             # Draw visualization if requested
             if self.show_window and display_frame is not None:
                 # Draw hand landmarks
@@ -382,6 +614,10 @@ class MediaPipeHandTracker:
                 pinch=pinch,
                 palm_width=palm_data['palm_width'],
                 palm_height=palm_data['palm_height'],
+                qx=qx,
+                qy=qy,
+                qz=qz,
+                qw=qw,
                 calibrated=self.calibrated
             )
         else:
@@ -400,6 +636,10 @@ class MediaPipeHandTracker:
                 pinch=0.0,
                 palm_width=0.0,
                 palm_height=0.0,
+                qx=0.0,  # Identity quaternion when no hand detected
+                qy=0.0,
+                qz=0.0,
+                qw=1.0,
                 calibrated=self.calibrated
             )
         

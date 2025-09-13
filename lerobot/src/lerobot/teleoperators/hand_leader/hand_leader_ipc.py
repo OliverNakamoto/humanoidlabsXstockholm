@@ -194,12 +194,13 @@ class HandLeaderIPC(Teleoperator):
 
     def get_endpos(self):
         """
-        Get current end effector position from IPC client.
+        Get current end effector position and orientation from IPC client.
         
         Returns:
-            Tuple of (x, y, z, pinch) where:
+            Tuple of (x, y, z, pinch, qx, qy, qz, qw) where:
             - x, y, z are in meters (robot workspace coordinates)
             - pinch is gripper percentage (0-100)
+            - qx, qy, qz, qw are quaternion components for orientation
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
@@ -207,9 +208,9 @@ class HandLeaderIPC(Teleoperator):
         client = self.client_manager.get_client()
         if not client:
             logger.warning("No active IPC client")
-            return (0.0, 0.2, 0.2, 0.0)
+            return (0.0, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 1.0)  # Identity quaternion
         
-        return client.get_current_position()
+        return client.get_current_position_and_orientation()
 
     def compute_ik(self, current_pos: Dict[str, float]) -> Dict[str, float]:
         """
@@ -222,17 +223,20 @@ class HandLeaderIPC(Teleoperator):
             Dictionary of joint positions including gripper
         """
         # Get end effector target from IPC
-        x, y, z, pinch = self.get_endpos()
+        x, y, z, pinch, qx, qy, qz, qw = self.get_endpos()
         
         # If no kinematics solver available, use simple mapping
         if self.kinematics is None:
-            return self._simple_position_mapping(x, y, z, pinch)
+            return self._simple_position_mapping(x, y, z, pinch, qx, qy, qz, qw)
         
         # Create target transformation matrix for IK
         target_pose = np.eye(4)
         target_pose[0, 3] = x  # X position
         target_pose[1, 3] = y  # Y position  
         target_pose[2, 3] = z  # Z position
+        
+        # Add orientation from quaternion
+        target_pose[:3, :3] = self._quaternion_to_rotation_matrix(qx, qy, qz, qw)
         
         # Extract current joint values for IK seed
         current_joints = []
@@ -280,25 +284,98 @@ class HandLeaderIPC(Teleoperator):
             
         except Exception as e:
             logger.warning(f"IK failed: {e}, using simple mapping")
-            return self._simple_position_mapping(x, y, z, pinch)
-
-    def _simple_position_mapping(self, x: float, y: float, z: float, pinch: float) -> Dict[str, float]:
-        """Simple position mapping when IK is not available."""
-        # Map hand position to joint angles (simplified)
+            return self._simple_position_mapping(x, y, z, pinch, qx, qy, qz, qw)
+        
+    def _simple_position_mapping(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        pinch: float,
+        qx: float | None = None,
+        qy: float | None = None,
+        qz: float | None = None,
+        qw: float | None = None,
+    ) -> Dict[str, float]:
+        """Simple position mapping when IK is not available.
+        
+        If orientation (quaternion) is provided, map yaw to `wrist_roll`.
+        """
+        # Base mapping from position only
         shoulder_pan = x * 300  # X controls pan
         shoulder_lift = -y * 200 + 50  # Y controls lift
         elbow_flex = z * 150 - 30  # Z affects elbow
         wrist_flex = y * 100  # Y also affects wrist
-        wrist_roll = x * 180  # X controls wrist roll
+        
+        # Default wrist roll from X if no orientation
+        wrist_roll = x * 180
+        
+        # If quaternion provided, use its yaw for wrist_roll
+        if None not in (qx, qy, qz, qw):
+            try:
+                roll, pitch, yaw = self._quaternion_to_euler(qx, qy, qz, qw)
+                # Map yaw (radians) to [-100, 100] via degrees/180*100
+                wrist_roll = np.degrees(yaw) / 180.0 * 100.0
+            except Exception as e:
+                logger.debug(f"Quaternion->euler conversion failed, fallback to position roll: {e}")
         
         return {
-            "shoulder_pan.pos": np.clip(shoulder_pan, -100, 100),
-            "shoulder_lift.pos": np.clip(shoulder_lift, -100, 100),
-            "elbow_flex.pos": np.clip(elbow_flex, -100, 100),
-            "wrist_flex.pos": np.clip(wrist_flex, -100, 100),
-            "wrist_roll.pos": np.clip(wrist_roll, -100, 100),
+            "shoulder_pan.pos": float(np.clip(shoulder_pan, -100, 100)),
+            "shoulder_lift.pos": float(np.clip(shoulder_lift, -100, 100)),
+            "elbow_flex.pos": float(np.clip(elbow_flex, -100, 100)),
+            "wrist_flex.pos": float(np.clip(wrist_flex, -100, 100)),
+            "wrist_roll.pos": float(np.clip(wrist_roll, -100, 100)),
             "gripper.pos": float(pinch),
         }
+
+    @staticmethod
+    def _quaternion_to_rotation_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+        """Convert quaternion to 3x3 rotation matrix."""
+        # Normalize to be safe
+        norm = np.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        if norm == 0:
+            return np.eye(3)
+        qx, qy, qz, qw = qx / norm, qy / norm, qz / norm, qw / norm
+        
+        # Precompute values
+        xx = qx * qx
+        yy = qy * qy
+        zz = qz * qz
+        xy = qx * qy
+        xz = qx * qz
+        yz = qy * qz
+        wx = qw * qx
+        wy = qw * qy
+        wz = qw * qz
+        
+        R = np.array([
+            [1 - 2 * (yy + zz),     2 * (xy - wz),         2 * (xz + wy)],
+            [2 * (xy + wz),         1 - 2 * (xx + zz),     2 * (yz - wx)],
+            [2 * (xz - wy),         2 * (yz + wx),         1 - 2 * (xx + yy)],
+        ])
+        return R
+
+    @staticmethod
+    def _quaternion_to_euler(qx: float, qy: float, qz: float, qw: float) -> tuple[float, float, float]:
+        """Convert quaternion to Euler angles (roll, pitch, yaw) in radians."""
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (qw * qx + qy * qz)
+        cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+        
+        # Pitch (y-axis rotation)
+        sinp = 2 * (qw * qy - qz * qx)
+        if abs(sinp) >= 1:
+            pitch = np.copysign(np.pi / 2, sinp)
+        else:
+            pitch = np.arcsin(sinp)
+        
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (qw * qz + qx * qy)
+        cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+        
+        return roll, pitch, yaw
 
     def get_action(self, current_pos: Dict[str, float] = None) -> Dict[str, float]:
         """

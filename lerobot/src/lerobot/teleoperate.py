@@ -89,7 +89,7 @@ from lerobot.teleoperators.hand_leader.hand_leader_ipc import HandLeaderIPC
 from lerobot.teleoperators.hand_leader.config_hand_leader import HandLeaderIPCConfig  # noqa: F401
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import init_logging, move_cursor_up
-from lerobot.utils.visualization_utils import _init_rerun, log_rerun_data, log_robot_urdf
+from lerobot.utils.visualization_utils import _init_rerun, log_rerun_data
 
 
 @dataclass
@@ -115,8 +115,7 @@ def teleop_loop(
         action = teleop.get_action(current_pos) #current pos is only used for hand leader, not so101!
         if display_data:
             observation = robot.get_observation()
-            robot_name = getattr(robot, 'name', None)
-            log_rerun_data(observation, action, robot_name)
+            log_rerun_data(observation, action)
 
         robot.send_action(action)
         dt_s = time.perf_counter() - loop_start
@@ -150,11 +149,6 @@ def teleoperate(cfg: TeleoperateConfig):
     # Initialize Rerun after teleop connection (and calibration) is complete
     if cfg.display_data:
         _init_rerun(session_name="teleoperation")
-        
-        # Log robot URDF for 3D visualization
-        if hasattr(robot, 'name') and robot.name == 'mock_so101':
-            urdf_path = "src/lerobot/robots/so101_follower/so101.urdf"
-            log_robot_urdf("so101", urdf_path)
 
     try:
         teleop_loop(teleop, robot, cfg.fps, display_data=cfg.display_data, duration=cfg.teleop_time_s)

@@ -43,7 +43,7 @@ MSG_TYPE_CALIBRATION = 4
 MSG_TYPE_CALIBRATION_COMPLETE = 5
 
 # Binary message format using struct
-# Format: '<BBfffffff' = little-endian, 2 bytes + 7 floats = 30 bytes
+# Format: '<BBfffffffffff' = little-endian, 2 bytes + 11 floats = 46 bytes
 # B: message type (1 byte)
 # B: flags (1 byte): bit 0 = hand_detected, bit 1 = calibrated
 # f: timestamp (4 bytes)
@@ -53,7 +53,11 @@ MSG_TYPE_CALIBRATION_COMPLETE = 5
 # f: pinch percentage (4 bytes)
 # f: palm_width (4 bytes)
 # f: palm_height (4 bytes)
-MESSAGE_FORMAT = '<BBfffffff'
+# f: quaternion x (4 bytes)
+# f: quaternion y (4 bytes)
+# f: quaternion z (4 bytes)
+# f: quaternion w (4 bytes)
+MESSAGE_FORMAT = '<BBfffffffffff'
 MESSAGE_SIZE = struct.calcsize(MESSAGE_FORMAT)
 
 
@@ -68,6 +72,10 @@ class HandTrackingData:
     pinch: float  # Pinch percentage 0-100
     palm_width: float  # Palm bounding box width in pixels
     palm_height: float  # Palm bounding box height in pixels
+    qx: float  # Quaternion x component
+    qy: float  # Quaternion y component
+    qz: float  # Quaternion z component
+    qw: float  # Quaternion w component
     calibrated: bool = True
     
     @classmethod
@@ -82,6 +90,10 @@ class HandTrackingData:
             pinch=0.0,
             palm_width=0.0,
             palm_height=0.0,
+            qx=0.0,  # Identity quaternion
+            qy=0.0,
+            qz=0.0,
+            qw=1.0,
             calibrated=False
         )
 
@@ -110,7 +122,11 @@ class HandTrackingProtocol:
                 data.z,             # z position
                 data.pinch,         # pinch percentage
                 data.palm_width,    # palm width
-                data.palm_height    # palm height
+                data.palm_height,   # palm height
+                data.qx,            # quaternion x
+                data.qy,            # quaternion y
+                data.qz,            # quaternion z
+                data.qw             # quaternion w
             )
             return message
         except struct.error as e:
@@ -126,7 +142,7 @@ class HandTrackingProtocol:
         
         try:
             unpacked = struct.unpack(MESSAGE_FORMAT, message)
-            msg_type, flags, timestamp, x, y, z, pinch, palm_width, palm_height = unpacked
+            msg_type, flags, timestamp, x, y, z, pinch, palm_width, palm_height, qx, qy, qz, qw = unpacked
             
             if msg_type != MSG_TYPE_HAND_DATA:
                 logger.warning(f"Invalid message type: {msg_type}")
@@ -144,6 +160,10 @@ class HandTrackingProtocol:
                 pinch=pinch,
                 palm_width=palm_width,
                 palm_height=palm_height,
+                qx=qx,
+                qy=qy,
+                qz=qz,
+                qw=qw,
                 calibrated=calibrated
             )
         except struct.error as e:
@@ -249,6 +269,10 @@ def create_test_data() -> HandTrackingData:
         pinch=50.0,
         palm_width=120.0,
         palm_height=80.0,
+        qx=0.0,
+        qy=0.0,
+        qz=0.707,  # 90-degree rotation around Z-axis
+        qw=0.707,
         calibrated=True
     )
 

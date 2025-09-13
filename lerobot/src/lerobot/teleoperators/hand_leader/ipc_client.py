@@ -271,6 +271,20 @@ class HandTrackingClient:
                 self.latest_data.pinch
             )
     
+    def get_current_position_and_orientation(self) -> tuple[float, float, float, float, float, float, float, float]:
+        """Get current hand position and orientation."""
+        with self.data_lock:
+            return (
+                self.latest_data.x,
+                self.latest_data.y,
+                self.latest_data.z,
+                self.latest_data.pinch,
+                self.latest_data.qx,
+                self.latest_data.qy,
+                self.latest_data.qz,
+                self.latest_data.qw
+            )
+    
     def is_connected(self) -> bool:
         """Check if client is connected to server."""
         return self.connected and self.running
