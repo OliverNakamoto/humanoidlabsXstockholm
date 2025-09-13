@@ -14,180 +14,254 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from lerobot.src.lerobot.model.kinematics import RobotKinematics
-
 import logging
 import time
+import numpy as np
+from typing import Dict, Any
 
 from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
-from lerobot.motors import Motor, MotorCalibration, MotorNormMode
-from lerobot.motors.feetech import (
-    FeetechMotorsBus,
-    OperatingMode,
-)
+from lerobot.model.kinematics import RobotKinematics
 
 from ..teleoperator import Teleoperator
 from .config_hand_leader import HandLeaderConfig
+from .cv_hand_tracker import get_tracker_instance
 
 logger = logging.getLogger(__name__)
 
 
-#added since the get actions function in normal class uses sync from motors
-from typing import Protocol, Tuple, TypeAlias
-Value: TypeAlias = int | float
-
-
 class HandLeader(Teleoperator):
     """
-    Hand Leader Arm designed by TheRobotStudio and Hugging Face.
+    Hand Leader using computer vision (MediaPipe) for teleoperation control.
+    Tracks hand position and pinch gesture to control robot arm.
     """
 
     config_class = HandLeaderConfig
-    name = "so101_leader"
+    name = "hand_leader"
 
     def __init__(self, config: HandLeaderConfig):
         super().__init__(config)
         self.config = config
-        norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
-        self.bus = FeetechMotorsBus(
-            port=self.config.port,
-            motors={
-                "shoulder_pan": Motor(1, "sts3215", norm_mode_body),
-                "shoulder_lift": Motor(2, "sts3215", norm_mode_body),
-                "elbow_flex": Motor(3, "sts3215", norm_mode_body),
-                "wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                "wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                "gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-            },
-            calibration=self.calibration,
+        
+        # Initialize CV tracker
+        self.tracker = get_tracker_instance(config.camera_index)
+        
+        # Initialize kinematics solver
+        self.kinematics = RobotKinematics(
+            urdf_path=config.urdf_path,
+            target_frame_name=config.target_frame_name,
+            joint_names=config.joint_names
         )
-
-    
-    self.kinematics = RobotKinematics(
-        urdf_path=env.unwrapped.robot.config.urdf_path,
-        target_frame_name=env.unwrapped.robot.config.target_frame_name,
-    )
+        
+        # Define joint limits (in degrees)
+        self.joint_limits = {
+            'shoulder_pan': (-90, 90),
+            'shoulder_lift': (-90, 90),
+            'elbow_flex': (-90, 90),
+            'wrist_flex': (-90, 90),
+            'wrist_roll': (-180, 180),
+        }
+        
+        self._is_connected = False
 
     @property
     def action_features(self) -> dict[str, type]:
-        return {f"{motor}.pos": float for motor in self.bus.motors}
+        """Define the action space for the robot."""
+        return {
+            "shoulder_pan.pos": float,
+            "shoulder_lift.pos": float,
+            "elbow_flex.pos": float,
+            "wrist_flex.pos": float,
+            "wrist_roll.pos": float,
+            "gripper.pos": float,
+        }
 
     @property
     def feedback_features(self) -> dict[str, type]:
+        """No feedback features for CV-based control."""
         return {}
 
     @property
     def is_connected(self) -> bool:
-        return self.bus.is_connected
+        return self._is_connected
 
     def connect(self, calibrate: bool = True) -> None:
+        """Connect to the CV tracker and run calibration if needed."""
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
-        self.bus.connect()
-        if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
+        logger.info("Connecting hand leader (CV tracker)...")
+        
+        # Initialize CV tracker
+        self.tracker.connect()
+        
+        # Run calibration if requested
+        if calibrate:
             self.calibrate()
-
-        self.configure()
+        else:
+            # If not calibrating, we need to start tracking manually
+            if not self.tracker.calibrated:
+                logger.warning("Tracker not calibrated, using default calibration values")
+                # Set some reasonable defaults
+                self.tracker.palm_bbox_far = 50
+                self.tracker.palm_bbox_near = 150
+                self.tracker.initial_thumb_index_dist = 100
+                self.tracker.calibrated = True
+            self.tracker.start_tracking()
+        
+        self._is_connected = True
         logger.info(f"{self} connected.")
 
     @property
     def is_calibrated(self) -> bool:
-        return self.bus.is_calibrated
+        """Check if the CV tracker is calibrated."""
+        return self.tracker.calibrated if self.tracker else False
 
     def calibrate(self) -> None:
-        if self.calibration:
-            # Calibration file exists, ask user whether to use it or run new calibration
-            user_input = input(
-                f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
-            )
-            if user_input.strip().lower() != "c":
-                logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
-                self.bus.write_calibration(self.calibration)
-                return
-
+        """Run the CV calibration routine."""
         logger.info(f"\nRunning calibration of {self}")
-        self.bus.disable_torque()
-        for motor in self.bus.motors:
-            self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
-
-        input(f"Move {self} to the middle of its range of motion and press ENTER....")
-        homing_offsets = self.bus.set_half_turn_homings()
-
-        print(
-            "Move all joints sequentially through their entire ranges "
-            "of motion.\nRecording positions. Press ENTER to stop..."
-        )
-        range_mins, range_maxes = self.bus.record_ranges_of_motion()
-
-        self.calibration = {}
-        for motor, m in self.bus.motors.items():
-            self.calibration[motor] = MotorCalibration(
-                id=m.id,
-                drive_mode=0,
-                homing_offset=homing_offsets[motor],
-                range_min=range_mins[motor],
-                range_max=range_maxes[motor],
-            )
-
-        self.bus.write_calibration(self.calibration)
-        self._save_calibration()
-        print(f"Calibration saved to {self.calibration_fpath}")
+        self.tracker.calibrate()
+        logger.info("Calibration complete")
 
     def configure(self) -> None:
-        self.bus.disable_torque()
-        self.bus.configure_motors()
-        for motor in self.bus.motors:
-            self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+        """No motor configuration needed for CV control."""
+        pass
 
     def setup_motors(self) -> None:
-        for motor in reversed(self.bus.motors):
-            input(f"Connect the controller board to the '{motor}' motor only and press enter.")
-            self.bus.setup_motor(motor)
-            print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
+        """No motor setup needed for CV control."""
+        pass
 
-    def get_endpos(sefl) -> Tuple:
-        #talk to the mediapipe code and get the size of the palm bounding box and the claw percentage
+    def get_endpos(self):
+        """
+        Get current end effector position from CV tracker.
+        
+        Returns:
+            Tuple of (x, y, z, pinch) where:
+            - x, y, z are in meters (robot workspace coordinates)
+            - pinch is gripper percentage (0-100)
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        
+        return self.tracker.get_current_position()
 
-        #implement this as a dict is super slow no? just a tuple is better or what is best for speed.
-        HandPos = mediapipe.get_current()
+    def compute_ik(self, current_pos: Dict[str, float]) -> Dict[str, float]:
+        """
+        Compute inverse kinematics from end effector position to joint angles.
+        
+        Args:
+            current_pos: Current joint positions (used as IK seed)
+            
+        Returns:
+            Dictionary of joint positions including gripper
+        """
+        # Get end effector target from CV
+        x, y, z, pinch = self.get_endpos()
+        
+        # Create target transformation matrix for IK
+        # Simple approach: keep orientation fixed, only change position
+        target_pose = np.eye(4)
+        target_pose[0, 3] = x  # X position
+        target_pose[1, 3] = y  # Y position  
+        target_pose[2, 3] = z  # Z position
+        
+        # Extract current joint values for IK seed
+        # Convert from normalized (-100 to 100) to degrees if needed
+        current_joints = []
+        for joint_name in self.config.joint_names:
+            key = f"{joint_name}.pos"
+            if key in current_pos:
+                # Assuming current_pos values are in normalized range -100 to 100
+                # Convert to degrees based on joint limits
+                norm_val = current_pos[key]
+                min_deg, max_deg = self.joint_limits.get(joint_name, (-90, 90))
+                # Convert from [-100, 100] to [min_deg, max_deg]
+                deg_val = min_deg + (norm_val + 100) * (max_deg - min_deg) / 200
+                current_joints.append(deg_val)
+            else:
+                current_joints.append(0.0)  # Default position
+        
+        current_joints = np.array(current_joints)
+        
+        # Compute IK
+        try:
+            joint_solution = self.kinematics.inverse_kinematics(
+                current_joints, 
+                target_pose,
+                position_weight=1.0,
+                orientation_weight=0.01  # Low weight on orientation
+            )
+            
+            # Convert joint angles back to normalized range
+            actions = {}
+            for i, joint_name in enumerate(self.config.joint_names):
+                if i < len(joint_solution):
+                    deg_val = joint_solution[i]
+                    min_deg, max_deg = self.joint_limits.get(joint_name, (-90, 90))
+                    # Convert from degrees to [-100, 100] range
+                    norm_val = 200 * (deg_val - min_deg) / (max_deg - min_deg) - 100
+                    norm_val = np.clip(norm_val, -100, 100)
+                    actions[f"{joint_name}.pos"] = float(norm_val)
+            
+            # Add gripper position (already in 0-100 range)
+            actions["gripper.pos"] = float(pinch)
+            
+            return actions
+            
+        except Exception as e:
+            logger.warning(f"IK failed: {e}, returning safe position")
+            # Return safe default position on IK failure
+            return {
+                "shoulder_pan.pos": 0.0,
+                "shoulder_lift.pos": 0.0,
+                "elbow_flex.pos": 0.0,
+                "wrist_flex.pos": 0.0,
+                "wrist_roll.pos": 0.0,
+                "gripper.pos": float(pinch),
+            }
 
-        return HandPos[0], HandPos[1]
-    
-    def IK(self, positions) -> dict[str, Value]:
-        current_pos, end_effector_pos, claw_percentage = positions
-
-        joints = self.kinematics.inverse_kinematics(current_pos, end_effector_pos)
-
-        #combine joints and claw percentage into one dict
-        actions = {f"{motor}.pos": val for motor, val in zip(self.bus.motors.keys(), joints)} #im not using any bus shit here, i am using coordinates from a cv model of a hand. +
-        actions["gripper.pos"] = claw_percentage
-
-        return actions #this is used in normal class:  return {self._id_to_name(id_): value for id_, value in ids_values.items()}
-
-
-
-
-    def get_action(self, current_pos) -> dict[str, float]:
+    def get_action(self, current_pos: Dict[str, float] = None) -> Dict[str, float]:
+        """
+        Get action by computing IK from CV-tracked hand position.
+        
+        Args:
+            current_pos: Current robot joint positions (used as IK seed)
+            
+        Returns:
+            Dictionary of target joint positions
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        
         start = time.perf_counter()
-        hand_pos = current_pos, self.get_endpos()
-        action = self.IK(hand_pos)
-        action = self.bus.sync_read("Present_Position")
-        action = {f"{motor}.pos": val for motor, val in action.items()}
+        
+        # Use provided current position or default
+        if current_pos is None:
+            current_pos = {
+                "shoulder_pan.pos": 0.0,
+                "shoulder_lift.pos": 0.0,
+                "elbow_flex.pos": 0.0,
+                "wrist_flex.pos": 0.0,
+                "wrist_roll.pos": 0.0,
+                "gripper.pos": 0.0,
+            }
+        
+        # Compute IK to get joint positions
+        action = self.compute_ik(current_pos)
+        
         dt_ms = (time.perf_counter() - start) * 1e3
-        logger.debug(f"{self} read action: {dt_ms:.1f}ms")
+        logger.debug(f"{self} computed action: {dt_ms:.1f}ms")
+        
         return action
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # TODO(rcadene, aliberts): Implement force feedback
-        raise NotImplementedError
+        """Force feedback not implemented for CV control."""
+        raise NotImplementedError("Force feedback not available for CV hand tracking")
 
     def disconnect(self) -> None:
+        """Disconnect the CV tracker."""
         if not self.is_connected:
-            DeviceNotConnectedError(f"{self} is not connected.")
+            raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        self.bus.disconnect()
+        self.tracker.disconnect()
+        self._is_connected = False
         logger.info(f"{self} disconnected.")
