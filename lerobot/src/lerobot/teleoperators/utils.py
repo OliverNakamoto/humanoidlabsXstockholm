@@ -69,5 +69,17 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> Teleoperator:
         from .hand_leader import HandLeader
 
         return HandLeader(config)
+    elif config.type == "hand_leader_simple":
+        from .hand_leader import HandLeaderSimple
+
+        return HandLeaderSimple(config)
+    elif config.type == "phone_leader":
+        from .phone_leader.phone_leader import PhoneLeader
+
+        return PhoneLeader(config)
+    elif config.type == "phone_gyro":
+        from .phone_gyro import PhoneGyro
+
+        return PhoneGyro(config)
     else:
         raise ValueError(config.type)
