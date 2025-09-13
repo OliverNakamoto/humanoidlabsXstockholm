@@ -314,6 +314,31 @@ class HandTrackingClient:
             logger.error(f"Failed to send calibration request: {e}")
             return False
     
+    def get_second_hand_pitch(self) -> float:
+        """Get current second hand pitch (0-100)."""
+        with self.data_lock:
+            return self.latest_data.second_hand_pitch
+    
+    def is_second_hand_detected(self) -> bool:
+        """Check if second hand is currently detected."""
+        with self.data_lock:
+            return self.latest_data.second_hand_detected
+    
+    def get_current_position_orientation_and_pitch(self) -> tuple[float, float, float, float, float, float, float, float, float]:
+        """Get current hand position, orientation, and second hand pitch."""
+        with self.data_lock:
+            return (
+                self.latest_data.x,
+                self.latest_data.y,
+                self.latest_data.z,
+                self.latest_data.pinch,
+                self.latest_data.qx,
+                self.latest_data.qy,
+                self.latest_data.qz,
+                self.latest_data.qw,
+                self.latest_data.second_hand_pitch
+            )
+    
     def get_data_age(self) -> float:
         """Get age of latest data in seconds."""
         with self.data_lock:
@@ -330,7 +355,9 @@ class HandTrackingClient:
                 'last_heartbeat_age': current_time - self.last_heartbeat,
                 'last_data_age': current_time - self.last_data_received,
                 'hand_detected': self.latest_data.hand_detected,
-                'calibrated': self.latest_data.calibrated
+                'calibrated': self.latest_data.calibrated,
+                'second_hand_detected': self.latest_data.second_hand_detected,
+                'second_hand_pitch': self.latest_data.second_hand_pitch
             }
     
     def set_data_callback(self, callback: Callable[[HandTrackingData], None]):

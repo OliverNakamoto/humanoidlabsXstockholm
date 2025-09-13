@@ -194,13 +194,14 @@ class HandLeaderIPC(Teleoperator):
 
     def get_endpos(self):
         """
-        Get current end effector position and orientation from IPC client.
+        Get current end effector position, orientation, and second hand pitch from IPC client.
         
         Returns:
-            Tuple of (x, y, z, pinch, qx, qy, qz, qw) where:
+            Tuple of (x, y, z, pinch, qx, qy, qz, qw, second_hand_pitch) where:
             - x, y, z are in meters (robot workspace coordinates)
             - pinch is gripper percentage (0-100)
             - qx, qy, qz, qw are quaternion components for orientation
+            - second_hand_pitch is the second hand pitch percentage (0-100)
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
@@ -208,9 +209,9 @@ class HandLeaderIPC(Teleoperator):
         client = self.client_manager.get_client()
         if not client:
             logger.warning("No active IPC client")
-            return (0.0, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 1.0)  # Identity quaternion
+            return (0.0, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 1.0, 50.0)  # Identity quaternion + neutral pitch
         
-        return client.get_current_position_and_orientation()
+        return client.get_current_position_orientation_and_pitch()
 
     def compute_ik(self, current_pos: Dict[str, float]) -> Dict[str, float]:
         """
@@ -222,12 +223,15 @@ class HandLeaderIPC(Teleoperator):
         Returns:
             Dictionary of joint positions including gripper
         """
-        # Get end effector target from IPC
-        x, y, z, pinch, qx, qy, qz, qw = self.get_endpos()
+        # Get end effector target from IPC including second hand pitch
+        x, y, z, pinch, qx, qy, qz, qw, second_hand_pitch = self.get_endpos()
         
         # If no kinematics solver available, use simple mapping
         if self.kinematics is None:
-            return self._simple_position_mapping(x, y, z, pinch, qx, qy, qz, qw)
+            actions = self._simple_position_mapping(x, y, z, pinch, qx, qy, qz, qw)
+            # Override joint 4 (wrist_flex) with second hand pitch
+            actions["wrist_flex.pos"] = self._convert_pitch_to_joint_value(second_hand_pitch)
+            return actions
         
         # Create target transformation matrix for IK
         target_pose = np.eye(4)
@@ -277,14 +281,20 @@ class HandLeaderIPC(Teleoperator):
                     norm_val = np.clip(norm_val, -100, 100)
                     actions[f"{joint_name}.pos"] = float(norm_val)
             
-            # Add gripper position
-            actions["gripper.pos"] = float(pinch)
+            # Add gripper position (inverted: 100 - pinch)
+            actions["gripper.pos"] = float(100.0 - pinch)
+            
+            # Override joint 4 (wrist_flex) with second hand pitch
+            actions["wrist_flex.pos"] = self._convert_pitch_to_joint_value(second_hand_pitch)
             
             return actions
             
         except Exception as e:
             logger.warning(f"IK failed: {e}, using simple mapping")
-            return self._simple_position_mapping(x, y, z, pinch, qx, qy, qz, qw)
+            actions = self._simple_position_mapping(x, y, z, pinch, qx, qy, qz, qw)
+            # Override joint 4 (wrist_flex) with second hand pitch
+            actions["wrist_flex.pos"] = self._convert_pitch_to_joint_value(second_hand_pitch)
+            return actions
         
     def _simple_position_mapping(
         self,
@@ -325,8 +335,36 @@ class HandLeaderIPC(Teleoperator):
             "elbow_flex.pos": float(np.clip(elbow_flex, -100, 100)),
             "wrist_flex.pos": float(np.clip(wrist_flex, -100, 100)),
             "wrist_roll.pos": float(np.clip(wrist_roll, -100, 100)),
-            "gripper.pos": float(pinch),
+            "gripper.pos": float(100.0 - pinch),
         }
+    
+    def _convert_pitch_to_joint_value(self, pitch_percentage: float) -> float:
+        """Convert second hand pitch percentage to joint 4 (wrist_flex) value.
+        
+        Args:
+            pitch_percentage: Pitch from second hand (0-100)
+                - 0% = hand pointing down (-90°)
+                - 50% = hand horizontal (0°)
+                - 100% = hand pointing up (+90°)
+                
+        Returns:
+            Joint value in normalized range (-100 to 100)
+        """
+        # Get wrist_flex joint limits
+        min_deg, max_deg = self.joint_limits.get('wrist_flex', (-90, 90))
+        
+        # Convert pitch percentage to degrees
+        # 0% -> -90°, 50% -> 0°, 100% -> +90°
+        pitch_degrees = (pitch_percentage - 50.0) * 1.8  # 1.8 = 90/50
+        
+        # Clamp to joint limits
+        pitch_degrees = np.clip(pitch_degrees, min_deg, max_deg)
+        
+        # Convert to normalized range (-100 to 100)
+        joint_value = 200 * (pitch_degrees - min_deg) / (max_deg - min_deg) - 100
+        joint_value = np.clip(joint_value, -100, 100)
+        
+        return float(joint_value)
 
     @staticmethod
     def _quaternion_to_rotation_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:

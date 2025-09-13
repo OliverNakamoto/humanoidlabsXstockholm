@@ -87,6 +87,11 @@ class MediaPipeHandTracker:
         self.neutral_orientation = None  # Neutral quaternion from calibration
         self.prev_euler = np.array([0.0, 0.0, 0.0])  # Previous Euler angles for EMA smoothing
         self.orientation_ema_alpha = 0.3  # EMA smoothing factor (lower = more smoothing)
+        
+        # Second hand tracking (for pitch control)
+        self.second_hand_pitch = 50.0  # Default neutral pitch (horizontal)
+        self.prev_second_hand_pitch = 50.0  # Previous pitch for EMA smoothing
+        self.second_hand_pitch_ema_alpha = 0.4  # EMA smoothing for pitch
     
     @staticmethod
     def _build_orthonormal_basis(wrist, index_mcp, pinky_mcp):
@@ -297,7 +302,7 @@ class MediaPipeHandTracker:
             # Initialize MediaPipe hands
             self.hands = self.mp_hands.Hands(
                 static_image_mode=False,
-                max_num_hands=1,
+                max_num_hands=2,  # Enable detection of 2 hands
                 min_detection_confidence=0.7,
                 min_tracking_confidence=0.7
             )
@@ -514,8 +519,51 @@ class MediaPipeHandTracker:
             'palm_height': palm_height
         }
     
+    def _calculate_hand_pitch(self, landmarks) -> float:
+        """Calculate hand pitch angle from MediaPipe landmarks.
+        
+        Args:
+            landmarks: MediaPipe hand landmarks
+            
+        Returns:
+            Pitch percentage (0-100) where:
+            - 0% = hand pointing down (-90°)
+            - 50% = hand horizontal (0°)
+            - 100% = hand pointing up (+90°)
+        """
+        try:
+            # Use wrist, index MCP, and pinky MCP for orientation
+            wrist = np.array([landmarks.landmark[0].x, landmarks.landmark[0].y, landmarks.landmark[0].z])
+            index_mcp = np.array([landmarks.landmark[5].x, landmarks.landmark[5].y, landmarks.landmark[5].z])  
+            pinky_mcp = np.array([landmarks.landmark[17].x, landmarks.landmark[17].y, landmarks.landmark[17].z])
+            
+            # Build orthonormal basis
+            R = self._build_orthonormal_basis(wrist, index_mcp, pinky_mcp)
+            
+            # Extract pitch angle from rotation matrix
+            # Pitch is rotation around Y-axis, extract from R[2,0] (forward Z component)
+            pitch_radians = np.arcsin(-np.clip(R[2, 0], -1.0, 1.0))
+            
+            # Convert to 0-100 percentage
+            # -π/2 (-90°) -> 0%, 0° -> 50%, π/2 (90°) -> 100%
+            pitch_degrees = np.degrees(pitch_radians)
+            pitch_percentage = 50.0 + (pitch_degrees / 90.0) * 50.0
+            pitch_percentage = np.clip(pitch_percentage, 0.0, 100.0)
+            
+            # Apply EMA smoothing
+            self.prev_second_hand_pitch = (
+                self.second_hand_pitch_ema_alpha * pitch_percentage +
+                (1.0 - self.second_hand_pitch_ema_alpha) * self.prev_second_hand_pitch
+            )
+            
+            return self.prev_second_hand_pitch
+            
+        except Exception as e:
+            logger.debug(f"Failed to calculate hand pitch: {e}")
+            return 50.0  # Default horizontal pitch
+    
     def process_frame(self) -> HandTrackingData:
-        """Process single frame and return hand tracking data."""
+        """Process single frame and return dual hand tracking data."""
         ret, frame = self.cap.read()
         if not ret:
             logger.warning("Failed to read frame from camera")
@@ -531,11 +579,50 @@ class MediaPipeHandTracker:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self.hands.process(rgb_frame)
         
+        # Initialize default values
+        primary_hand = None
+        second_hand = None
+        second_hand_pitch = 50.0  # Default horizontal
+        second_hand_detected = False
+        
+        # Store handedness info for visualization
+        primary_hand_info = {"confidence": 0.0}
+        second_hand_info = {"confidence": 0.0}
+        
         if results.multi_hand_landmarks and self.calibrated:
-            landmarks = results.multi_hand_landmarks[0]
-            
+            # Classify hands by MediaPipe handedness (Left/Right)
+            for i, landmarks in enumerate(results.multi_hand_landmarks):
+                # Get handedness classification for this hand
+                handedness_label = "Unknown"
+                handedness_confidence = 0.0
+                
+                if results.multi_handedness and i < len(results.multi_handedness):
+                    handedness = results.multi_handedness[i]
+                    if handedness.classification:
+                        handedness_label = handedness.classification[0].label
+                        handedness_confidence = handedness.classification[0].score
+                
+                # Right hand = Primary hand (position + orientation)
+                # Left hand = Secondary hand (pitch control)
+                if handedness_label == "Right":
+                    primary_hand = landmarks
+                    primary_hand_info = {"confidence": handedness_confidence, "landmarks": landmarks}
+                elif handedness_label == "Left":
+                    second_hand = landmarks
+                    second_hand_detected = True
+                    second_hand_info = {"confidence": handedness_confidence, "landmarks": landmarks}
+                else:
+                    # Fallback: if handedness unclear, treat as primary hand
+                    if primary_hand is None:
+                        primary_hand = landmarks
+                        primary_hand_info = {"confidence": handedness_confidence, "landmarks": landmarks}
+                    
+                logger.debug(f"Hand {i}: {handedness_label} (confidence: {handedness_confidence:.2f})")
+        
+        # Process primary hand (position + orientation control)
+        if primary_hand is not None:
             # Calculate palm data
-            palm_data = self._calculate_palm_bbox(landmarks, w, h)
+            palm_data = self._calculate_palm_bbox(primary_hand, w, h)
             
             # Calculate normalized X, Y position (0 to 1)
             norm_x = palm_data['center'][0] / w
@@ -552,8 +639,8 @@ class MediaPipeHandTracker:
                 norm_z = 0.5
             
             # Calculate pinch percentage
-            thumb_tip = landmarks.landmark[4]
-            index_tip = landmarks.landmark[8]
+            thumb_tip = primary_hand.landmark[4]
+            index_tip = primary_hand.landmark[8]
             thumb_index_dist = np.sqrt(
                 (thumb_tip.x - index_tip.x)**2 + 
                 (thumb_tip.y - index_tip.y)**2
@@ -573,17 +660,33 @@ class MediaPipeHandTracker:
             
             # Calculate hand orientation
             try:
-                orientation_quat = self._calculate_hand_orientation(landmarks, w, h)
+                orientation_quat = self._calculate_hand_orientation(primary_hand, w, h)
                 qx, qy, qz, qw = orientation_quat
             except Exception as e:
                 logger.warning(f"Failed to calculate orientation: {e}")
                 qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0  # Identity quaternion
             
-            # Draw visualization if requested
-            if self.show_window and display_frame is not None:
-                # Draw hand landmarks
+            hand_detected = True
+            
+        else:
+            # No primary hand detected - use defaults
+            x, y, z = 0.0, 0.2, 0.2
+            pinch = 0.0
+            qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0  # Identity quaternion
+            palm_data = {'palm_width': 0.0, 'palm_height': 0.0, 'bbox': (0, 0, 0, 0), 'center': (0, 0)}
+            hand_detected = False
+        
+        # Process second hand (pitch control)
+        if second_hand is not None:
+            second_hand_pitch = self._calculate_hand_pitch(second_hand)
+        
+        # Draw visualization if requested
+        if self.show_window and display_frame is not None:
+            # Draw primary hand (RIGHT hand in green)
+            if primary_hand is not None:
                 self.mp_draw.draw_landmarks(
-                    display_frame, landmarks, self.mp_hands.HAND_CONNECTIONS)
+                    display_frame, primary_hand, self.mp_hands.HAND_CONNECTIONS,
+                    landmark_drawing_spec=self.mp_draw.DrawingSpec(color=(0, 255, 0), thickness=2))
                 
                 # Draw palm bounding box
                 bbox = palm_data['bbox']
@@ -594,54 +697,65 @@ class MediaPipeHandTracker:
                 
                 # Draw center point
                 center = palm_data['center']
-                cv2.circle(display_frame, center, 5, (255, 0, 0), -1)
+                cv2.circle(display_frame, center, 5, (0, 255, 0), -1)
                 
-                # Display tracking info
-                info_text = f"Hand: ({x:.3f}, {y:.3f}, {z:.3f}) Pinch: {pinch:.1f}%"
+                # Add RIGHT HAND label
+                label_text = f"RIGHT HAND ({primary_hand_info['confidence']:.1f})"
+                cv2.putText(display_frame, label_text, (center[0] - 50, center[1] - 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Draw second hand (LEFT hand in red)
+            if second_hand is not None:
+                self.mp_draw.draw_landmarks(
+                    display_frame, second_hand, self.mp_hands.HAND_CONNECTIONS,
+                    landmark_drawing_spec=self.mp_draw.DrawingSpec(color=(0, 0, 255), thickness=2))
+                
+                # Get wrist position for label placement
+                wrist = second_hand.landmark[0]
+                wrist_x = int(wrist.x * w)
+                wrist_y = int(wrist.y * h)
+                
+                # Add LEFT HAND label
+                label_text = f"LEFT HAND ({second_hand_info['confidence']:.1f})"
+                cv2.putText(display_frame, label_text, (wrist_x - 50, wrist_y - 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            
+            # Display tracking info
+            if hand_detected:
+                info_text = f"Right Hand: ({x:.3f}, {y:.3f}, {z:.3f}) Pinch: {pinch:.1f}%"
                 cv2.putText(display_frame, info_text, (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                if not self.calibrated:
-                    cv2.putText(display_frame, "NOT CALIBRATED", (10, 60), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
-            result = HandTrackingData(
-                timestamp=time.time(),
-                hand_detected=True,
-                x=x,
-                y=y,
-                z=z,
-                pinch=pinch,
-                palm_width=palm_data['palm_width'],
-                palm_height=palm_data['palm_height'],
-                qx=qx,
-                qy=qy,
-                qz=qz,
-                qw=qw,
-                calibrated=self.calibrated
-            )
-        else:
-            # No hand detected or not calibrated
-            if self.show_window and display_frame is not None:
-                status_text = "No hand detected" if self.calibrated else "Not calibrated - run calibration first"
-                cv2.putText(display_frame, status_text, (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if second_hand_detected:
+                pitch_text = f"Left Hand Pitch: {second_hand_pitch:.1f}%"
+                cv2.putText(display_frame, pitch_text, (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             
-            result = HandTrackingData(
-                timestamp=time.time(),
-                hand_detected=False,
-                x=0.0,
-                y=0.2,
-                z=0.2,
-                pinch=0.0,
-                palm_width=0.0,
-                palm_height=0.0,
-                qx=0.0,  # Identity quaternion when no hand detected
-                qy=0.0,
-                qz=0.0,
-                qw=1.0,
-                calibrated=self.calibrated
-            )
+            if not self.calibrated:
+                cv2.putText(display_frame, "NOT CALIBRATED - Right hand for position, Left hand for pitch", (10, 90), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+            elif not hand_detected and not second_hand_detected:
+                cv2.putText(display_frame, "Show hands: Right=Position/Grip, Left=Pitch", (10, 90), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        
+        # Create result with all data including second hand pitch
+        result = HandTrackingData(
+            timestamp=time.time(),
+            hand_detected=hand_detected,
+            x=x,
+            y=y,
+            z=z,
+            pinch=pinch,
+            palm_width=palm_data['palm_width'],
+            palm_height=palm_data['palm_height'],
+            qx=qx,
+            qy=qy,
+            qz=qz,
+            qw=qw,
+            second_hand_pitch=second_hand_pitch,
+            calibrated=self.calibrated,
+            second_hand_detected=second_hand_detected
+        )
         
         # Show visualization window if requested
         if self.show_window and display_frame is not None:

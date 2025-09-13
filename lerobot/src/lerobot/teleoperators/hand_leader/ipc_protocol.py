@@ -43,9 +43,9 @@ MSG_TYPE_CALIBRATION = 4
 MSG_TYPE_CALIBRATION_COMPLETE = 5
 
 # Binary message format using struct
-# Format: '<BBfffffffffff' = little-endian, 2 bytes + 11 floats = 46 bytes
+# Format: '<BBffffffffffff' = little-endian, 2 bytes + 12 floats = 50 bytes
 # B: message type (1 byte)
-# B: flags (1 byte): bit 0 = hand_detected, bit 1 = calibrated
+# B: flags (1 byte): bit 0 = hand_detected, bit 1 = calibrated, bit 2 = second_hand_detected
 # f: timestamp (4 bytes)
 # f: x position (4 bytes)
 # f: y position (4 bytes) 
@@ -57,7 +57,8 @@ MSG_TYPE_CALIBRATION_COMPLETE = 5
 # f: quaternion y (4 bytes)
 # f: quaternion z (4 bytes)
 # f: quaternion w (4 bytes)
-MESSAGE_FORMAT = '<BBfffffffffff'
+# f: second hand pitch (0-100, 4 bytes)
+MESSAGE_FORMAT = '<BBffffffffffff'
 MESSAGE_SIZE = struct.calcsize(MESSAGE_FORMAT)
 
 
@@ -76,7 +77,9 @@ class HandTrackingData:
     qy: float  # Quaternion y component
     qz: float  # Quaternion z component
     qw: float  # Quaternion w component
+    second_hand_pitch: float  # Second hand pitch percentage 0-100
     calibrated: bool = True
+    second_hand_detected: bool = False
     
     @classmethod
     def create_default(cls) -> 'HandTrackingData':
@@ -94,7 +97,9 @@ class HandTrackingData:
             qy=0.0,
             qz=0.0,
             qw=1.0,
-            calibrated=False
+            second_hand_pitch=50.0,  # Default neutral pitch (horizontal)
+            calibrated=False,
+            second_hand_detected=False
         )
 
 
@@ -110,6 +115,8 @@ class HandTrackingProtocol:
             flags |= 0x01
         if data.calibrated:
             flags |= 0x02
+        if data.second_hand_detected:
+            flags |= 0x04
         
         try:
             message = struct.pack(
@@ -126,7 +133,8 @@ class HandTrackingProtocol:
                 data.qx,            # quaternion x
                 data.qy,            # quaternion y
                 data.qz,            # quaternion z
-                data.qw             # quaternion w
+                data.qw,            # quaternion w
+                data.second_hand_pitch  # second hand pitch
             )
             return message
         except struct.error as e:
@@ -142,7 +150,7 @@ class HandTrackingProtocol:
         
         try:
             unpacked = struct.unpack(MESSAGE_FORMAT, message)
-            msg_type, flags, timestamp, x, y, z, pinch, palm_width, palm_height, qx, qy, qz, qw = unpacked
+            msg_type, flags, timestamp, x, y, z, pinch, palm_width, palm_height, qx, qy, qz, qw, second_hand_pitch = unpacked
             
             if msg_type != MSG_TYPE_HAND_DATA:
                 logger.warning(f"Invalid message type: {msg_type}")
@@ -150,6 +158,7 @@ class HandTrackingProtocol:
             
             hand_detected = bool(flags & 0x01)
             calibrated = bool(flags & 0x02)
+            second_hand_detected = bool(flags & 0x04)
             
             return HandTrackingData(
                 timestamp=timestamp,
@@ -164,7 +173,9 @@ class HandTrackingProtocol:
                 qy=qy,
                 qz=qz,
                 qw=qw,
-                calibrated=calibrated
+                second_hand_pitch=second_hand_pitch,
+                calibrated=calibrated,
+                second_hand_detected=second_hand_detected
             )
         except struct.error as e:
             logger.error(f"Failed to unpack hand data: {e}")
@@ -235,6 +246,11 @@ class MessageValidator:
                 logger.warning(f"Palm height out of range: {data.palm_height}")
                 return False
         
+        # Check second hand pitch percentage
+        if not (0.0 <= data.second_hand_pitch <= 100.0):
+            logger.warning(f"Second hand pitch out of range: {data.second_hand_pitch}")
+            return False
+        
         return True
     
     @staticmethod
@@ -255,6 +271,9 @@ class MessageValidator:
         sanitized.palm_width = max(0.0, min(1000.0, data.palm_width))
         sanitized.palm_height = max(0.0, min(1000.0, data.palm_height))
         
+        # Clamp second hand pitch percentage
+        sanitized.second_hand_pitch = max(0.0, min(100.0, data.second_hand_pitch))
+        
         return sanitized
 
 
@@ -273,7 +292,9 @@ def create_test_data() -> HandTrackingData:
         qy=0.0,
         qz=0.707,  # 90-degree rotation around Z-axis
         qw=0.707,
-        calibrated=True
+        second_hand_pitch=75.0,  # Test pitch value
+        calibrated=True,
+        second_hand_detected=True
     )
 
 
