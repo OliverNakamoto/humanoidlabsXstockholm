@@ -14,7 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config_hand_leader import HandLeaderConfig
-from .hand_leader import HandLeader
+# Import configs (these don't depend on MediaPipe)
+from .config_hand_leader import HandLeaderConfig, HandLeaderIPCConfig
 
-__all__ = ["HandLeader", "HandLeaderConfig"]
+# Import IPC version (no MediaPipe dependency in main process)
+from .hand_leader_ipc import HandLeaderIPC
+
+# Note: HandLeader (old version) not imported to avoid MediaPipe dependency in main process
+# It runs MediaPipe directly, while HandLeaderIPC uses two-process architecture
+
+__all__ = ["HandLeaderConfig", "HandLeaderIPCConfig", "HandLeaderIPC"]

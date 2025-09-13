@@ -16,6 +16,7 @@
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
+
 [project.urls]
 homepage = "https://huggingface.co/lerobot"
 documentation = "https://huggingface.co/docs/lerobot/index"
@@ -57,12 +58,10 @@ classifiers = [
 keywords = ["lerobot", "huggingface", "robotics",  "machine learning", "artificial intelligence"]
 
 dependencies = [
-
     # Hugging Face dependencies
     "datasets>=2.19.0,<=3.6.0", # TODO: Bumb dependency
     "diffusers>=0.27.2",
     "huggingface-hub[hf-transfer,cli]>=0.34.2",
-
     # Core dependencies
     "cmake>=3.29.0.1",
     "einops>=0.8.0",
@@ -76,11 +75,9 @@ dependencies = [
     "pynput>=1.7.7",
     "pyserial>=3.5",
     "wandb>=0.20.0",
-
     "draccus==0.10.0", # TODO: Remove ==
     "gymnasium>=0.29.1,<1.0.0", # TODO: Bumb dependency
     "rerun-sdk>=0.21.0,<0.23.0", # TODO: Bumb dependency
-
     # Support dependencies
     "deepdiff>=7.0.1,<9.0.0",
     "flask>=3.0.3,<4.0.0",
@@ -119,14 +116,19 @@ intelrealsense = [
 # Policies
 pi0 = ["lerobot[transformers-dep]"]
 smolvla = ["lerobot[transformers-dep]", "num2words>=0.5.14", "accelerate>=1.7.0", "safetensors>=0.4.3"]
-hilserl = ["lerobot[transformers-dep]", "gym-hil>=0.1.9", "lerobot[grpcio-dep]", "lerobot[placo-dep]"]
+hilserl = ["lerobot[transformers-dep]", "gym-hil>=0.1.9", "lerobot[placo-dep]"]  # Removed grpcio-dep temporarily
 
 # Features
-async = ["lerobot[grpcio-dep]", "matplotlib>=3.10.3"]
+async = ["matplotlib>=3.10.3"]  # Removed grpcio-dep temporarily for hand_tracking compatibility
+hand_tracking = [
+    # MediaPipe runs in separate process (cv/.venv) to avoid protobuf conflicts
+    # "mediapipe>=0.10.21",  # Removed - runs in cv/.venv
+    # "opencv-python-headless>=4.9.0",  # Removed - not needed for IPC client
+]
 
 # Development
 docs = ["hf-doc-builder @ git+https://github.com/huggingface/doc-builder.git@main", "watchdog >= 6.0.0"]
-dev = ["pre-commit>=3.7.0", "debugpy>=1.8.1", "lerobot[grpcio-dep]", "grpcio-tools==1.73.1"]
+dev = ["pre-commit>=3.7.0", "debugpy>=1.8.1", "grpcio-tools==1.73.1"]  # Removed grpcio-dep temporarily
 test = ["pytest>=8.1.0", "pytest-timeout>=2.4.0", "pytest-cov>=5.0.0", "mock-serial>=0.0.1 ; sys_platform != 'win32'"]
 video_benchmark = ["scikit-image>=0.23.2", "pandas>=2.2.2"]
 

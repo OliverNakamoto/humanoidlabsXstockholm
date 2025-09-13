@@ -69,5 +69,9 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> Teleoperator:
         from .hand_leader import HandLeader
 
         return HandLeader(config)
+    elif config.type == "hand_leader_ipc":
+        from .hand_leader.hand_leader_ipc import HandLeaderIPC
+
+        return HandLeaderIPC(config)
     else:
         raise ValueError(config.type)

@@ -43,3 +43,33 @@ class HandLeaderConfig(TeleoperatorConfig):
     
     # Whether to use degrees (True) or normalized range (False)
     use_degrees: bool = False
+
+
+@TeleoperatorConfig.register_subclass("hand_leader_ipc")
+@dataclass
+class HandLeaderIPCConfig(TeleoperatorConfig):
+    """Configuration for Hand Leader with IPC (MediaPipe in separate process)."""
+    
+    # Camera index for MediaPipe tracking
+    camera_index: int = 0
+    
+    # Unix socket path for IPC communication
+    socket_path: str = "/tmp/lerobot_hand_tracking.sock"
+    
+    # Path to robot URDF file for kinematics (optional)
+    urdf_path: str = ""
+    
+    # Target frame name in URDF for end effector
+    target_frame_name: str = "gripper_frame_link"
+    
+    # Joint names for IK solver (in order)
+    joint_names: List[str] = field(default_factory=lambda: [
+        "shoulder_pan",
+        "shoulder_lift", 
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_roll"
+    ])
+    
+    # Whether to show the live tracking visualization window
+    show_window: bool = False

@@ -1,0 +1,14 @@
+[project]
+name = "hand-tracking"
+version = "0.1.0"
+description = "MediaPipe hand tracking for LeRobot"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "mediapipe>=0.10.21",
+    "opencv-python>=4.0.0",
+    "numpy>=1.20.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

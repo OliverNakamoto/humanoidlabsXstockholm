@@ -78,18 +78,18 @@ from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_so100_leader,
     gamepad,
-    hand_cv,
     homunculus,
     koch_leader,
     make_teleoperator_from_config,
     so100_leader,
     so101_leader,
 )
-# Import hand leader for CV tracking
-from lerobot.teleoperators.hand_leader import HandLeader, HandLeaderConfig  # noqa: F401
+# Import hand leader IPC for MediaPipe tracking (two-process architecture)
+from lerobot.teleoperators.hand_leader.hand_leader_ipc import HandLeaderIPC
+from lerobot.teleoperators.hand_leader.config_hand_leader import HandLeaderIPCConfig  # noqa: F401
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import init_logging, move_cursor_up
-from lerobot.utils.visualization_utils import _init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import _init_rerun, log_rerun_data, log_robot_urdf
 
 
 @dataclass
@@ -115,7 +115,8 @@ def teleop_loop(
         action = teleop.get_action(current_pos) #current pos is only used for hand leader, not so101!
         if display_data:
             observation = robot.get_observation()
-            log_rerun_data(observation, action)
+            robot_name = getattr(robot, 'name', None)
+            log_rerun_data(observation, action, robot_name)
 
         robot.send_action(action)
         dt_s = time.perf_counter() - loop_start
@@ -139,14 +140,21 @@ def teleop_loop(
 def teleoperate(cfg: TeleoperateConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))
-    if cfg.display_data:
-        _init_rerun(session_name="teleoperation")
 
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
 
-    teleop.connect()
+    teleop.connect()  # This will wait for calibration to complete
     robot.connect()
+
+    # Initialize Rerun after teleop connection (and calibration) is complete
+    if cfg.display_data:
+        _init_rerun(session_name="teleoperation")
+        
+        # Log robot URDF for 3D visualization
+        if hasattr(robot, 'name') and robot.name == 'mock_so101':
+            urdf_path = "src/lerobot/robots/so101_follower/so101.urdf"
+            log_robot_urdf("so101", urdf_path)
 
     try:
         teleop_loop(teleop, robot, cfg.fps, display_data=cfg.display_data, duration=cfg.teleop_time_s)
