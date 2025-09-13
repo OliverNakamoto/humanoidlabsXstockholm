@@ -24,7 +24,7 @@ from lerobot.model.kinematics import RobotKinematics
 
 from ..teleoperator import Teleoperator
 from .config_hand_leader import HandLeaderConfig
-from .cv_hand_tracker import get_tracker_instance
+from .cv_hand_tracker_ipc import get_tracker_instance
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,10 @@ class HandLeader(Teleoperator):
             'wrist_flex': (-90, 90),
             'wrist_roll': (-180, 180),
         }
+        
+        # Minimal smoothing to reduce jitter without adding latency
+        self._prev_xyz = None
+        self._pos_smoothing_alpha = 0.2
         
         self._is_connected = False
 
@@ -156,13 +160,28 @@ class HandLeader(Teleoperator):
         """
         # Get end effector target from CV
         x, y, z, pinch = self.get_endpos()
+
+        # Optional Y inversion so hand down -> robot down
+        if self.config.invert_y:
+            y = -y
+
+        # Light smoothing on XYZ target to reduce jitter
+        if self._prev_xyz is None:
+            sx, sy, sz = x, y, z
+        else:
+            px, py, pz = self._prev_xyz
+            a = self._pos_smoothing_alpha
+            sx = px * a + x * (1 - a)
+            sy = py * a + y * (1 - a)
+            sz = pz * a + z * (1 - a)
+        self._prev_xyz = (sx, sy, sz)
         
         # Create target transformation matrix for IK
         # Simple approach: keep orientation fixed, only change position
         target_pose = np.eye(4)
-        target_pose[0, 3] = x  # X position
-        target_pose[1, 3] = y  # Y position  
-        target_pose[2, 3] = z  # Z position
+        target_pose[0, 3] = sx  # X position
+        target_pose[1, 3] = sy  # Y position  
+        target_pose[2, 3] = sz  # Z position
         
         # Extract current joint values for IK seed
         # Convert from normalized (-100 to 100) to degrees if needed
@@ -202,21 +221,26 @@ class HandLeader(Teleoperator):
                     norm_val = np.clip(norm_val, -100, 100)
                     actions[f"{joint_name}.pos"] = float(norm_val)
             
-            # Add gripper position (already in 0-100 range)
-            actions["gripper.pos"] = float(pinch)
+            # Add gripper position with optional inversion (pinch closes gripper)
+            if self.config.invert_pinch:
+                actions["gripper.pos"] = float(100.0 - pinch)
+            else:
+                actions["gripper.pos"] = float(pinch)
             
             return actions
             
         except Exception as e:
             logger.warning(f"IK failed: {e}, returning safe position")
             # Return safe default position on IK failure
+            # Keep pinch mapping consistent on failure
+            fail_grip = float(100.0 - pinch) if self.config.invert_pinch else float(pinch)
             return {
                 "shoulder_pan.pos": 0.0,
                 "shoulder_lift.pos": 0.0,
                 "elbow_flex.pos": 0.0,
                 "wrist_flex.pos": 0.0,
                 "wrist_roll.pos": 0.0,
-                "gripper.pos": float(pinch),
+                "gripper.pos": fail_grip,
             }
 
     def get_action(self, current_pos: Dict[str, float] = None) -> Dict[str, float]:

@@ -156,6 +156,11 @@ class SO101Follower(Robot):
                 # Set I_Coefficient and D_Coefficient to default value 0 and 32
                 self.bus.write("I_Coefficient", motor, 0)
                 self.bus.write("D_Coefficient", motor, 32)
+                # Increase maximum velocity limit for snappier response where supported
+                try:
+                    self.bus.write("Maximum_Velocity_Limit", motor, 254, normalize=False)
+                except Exception:
+                    pass
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):

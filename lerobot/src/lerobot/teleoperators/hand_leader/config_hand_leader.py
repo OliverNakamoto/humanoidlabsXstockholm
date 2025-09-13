@@ -43,3 +43,14 @@ class HandLeaderConfig(TeleoperatorConfig):
     
     # Whether to use degrees (True) or normalized range (False)
     use_degrees: bool = False
+    
+    # Control inversions
+    invert_y: bool = True        # Move hand down -> robot down
+    invert_pinch: bool = True    # Pinch closes gripper
+
+
+@TeleoperatorConfig.register_subclass("hand_leader_simple")
+@dataclass
+class HandLeaderSimpleConfig(TeleoperatorConfig):
+    # Camera index for OpenCV (default 0 for primary camera)
+    camera_index: int = 0

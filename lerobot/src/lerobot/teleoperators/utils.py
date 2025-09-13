@@ -69,5 +69,9 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> Teleoperator:
         from .hand_leader import HandLeader
 
         return HandLeader(config)
+    elif config.type == "hand_leader_simple":
+        from .hand_leader import HandLeaderSimple
+
+        return HandLeaderSimple(config)
     else:
         raise ValueError(config.type)

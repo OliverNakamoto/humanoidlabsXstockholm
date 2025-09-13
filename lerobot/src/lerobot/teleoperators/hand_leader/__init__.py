@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config_hand_leader import HandLeaderConfig
+from .config_hand_leader import HandLeaderConfig, HandLeaderSimpleConfig
 from .hand_leader import HandLeader
+from .hand_leader_simple import HandLeaderSimple
 
-__all__ = ["HandLeader", "HandLeaderConfig"]
+__all__ = ["HandLeader", "HandLeaderConfig", "HandLeaderSimple", "HandLeaderSimpleConfig"]

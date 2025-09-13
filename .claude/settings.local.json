@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 10 python -m src.lerobot.teleoperate:*)",
+      "Bash(hand_tracking_venvScriptsactivate.bat)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

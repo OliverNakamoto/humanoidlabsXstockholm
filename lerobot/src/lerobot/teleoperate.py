@@ -72,13 +72,13 @@ from lerobot.robots import (  # noqa: F401
     so101_follower,
 )
 # Import mock robot for testing
-from tests.mocks.mock_so101_robot import MockSO101Robot, MockSO101Config  # noqa: F401
+# from tests.mocks.mock_so101_robot import MockSO101Robot, MockSO101Config  # noqa: F401
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
     bi_so100_leader,
     gamepad,
-    hand_cv,
+    # hand_cv,
     homunculus,
     koch_leader,
     make_teleoperator_from_config,
@@ -86,7 +86,7 @@ from lerobot.teleoperators import (  # noqa: F401
     so101_leader,
 )
 # Import hand leader for CV tracking
-from lerobot.teleoperators.hand_leader import HandLeader, HandLeaderConfig  # noqa: F401
+from lerobot.teleoperators.hand_leader import HandLeader, HandLeaderConfig, HandLeaderSimple, HandLeaderSimpleConfig  # noqa: F401
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import _init_rerun, log_rerun_data
@@ -98,7 +98,7 @@ class TeleoperateConfig:
     teleop: TeleoperatorConfig
     robot: RobotConfig
     # Limit the maximum frames per second.
-    fps: int = 60
+    fps: int = 120
     teleop_time_s: float | None = None
     # Display all cameras on screen
     display_data: bool = False
