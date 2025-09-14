@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(ngrok config:*)",
-      "Bash(where ngrok)"
+      "Bash(where ngrok)",
+      "Bash(python:*)",
+      "Bash(tasklist)",
+      "Bash(findstr:*)"
     ],
     "deny": [],
     "ask": []

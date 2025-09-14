@@ -30,8 +30,8 @@ keyboard_teleop_path = os.path.join(os.path.dirname(__file__), '..', '..', '..',
 if os.path.exists(keyboard_teleop_path):
     sys.path.insert(0, keyboard_teleop_path)
     try:
-        from forward_kinematics import forward_kinematics
-        from inverse_kinematics import iterative_ik
+        from .forward_kinematics import forward_kinematics
+        from .inverse_kinematics import iterative_ik
         HAS_KEYBOARD_IK = True
         logging.info("Loaded keyboard_teleop IK functions")
     except ImportError as e:

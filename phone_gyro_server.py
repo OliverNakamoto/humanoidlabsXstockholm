@@ -33,6 +33,12 @@ class PhoneGyroData:
             # Raw accelerometer (for orientation reference)
             self.accel = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
+            # Joystick data
+            self.joystick = {'x': 0.0, 'y': 0.0}
+
+            # Gripper state
+            self.gripper_closed = False
+
             # Control parameters
             self.valid = False
             self.timestamp = time.time()
@@ -50,6 +56,12 @@ class PhoneGyroData:
 
             if 'orientation' in gyro_data:
                 self.orientation = gyro_data['orientation']
+
+            if 'joystick' in gyro_data:
+                self.joystick = gyro_data['joystick']
+
+            if 'gripper_closed' in gyro_data:
+                self.gripper_closed = gyro_data['gripper_closed']
 
             # Integrate gyroscope for position control
             dt = time.time() - self.timestamp
@@ -133,6 +145,20 @@ class PhoneGyroHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logger.error(f"Error processing gyro data: {e}")
                 self.send_json_response({'success': False, 'error': str(e)}, 400)
+        elif self.path == '/joystick':
+            try:
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+                joystick_data = json.loads(post_data.decode('utf-8'))
+
+                # Update joystick data
+                self.server.gyro_data.update(joystick_data)
+
+                self.send_json_response({'success': True})
+
+            except Exception as e:
+                logger.error(f"Error processing joystick data: {e}")
+                self.send_json_response({'success': False, 'error': str(e)}, 400)
         else:
             self.send_error(404)
 
@@ -152,6 +178,8 @@ class PhoneGyroHandler(BaseHTTPRequestHandler):
         status = {
             'position': {'x': x, 'y': y, 'z': z},
             'orientation': {'roll': roll, 'pitch': pitch, 'yaw': yaw},
+            'joystick': self.server.gyro_data.joystick,
+            'gripper_closed': self.server.gyro_data.gripper_closed,
             'calibrated': self.server.gyro_data.calibrated,
             'valid': self.server.gyro_data.valid,
             'timestamp': self.server.gyro_data.timestamp
@@ -266,6 +294,65 @@ class PhoneGyroHandler(BaseHTTPRequestHandler):
             text-align: left;
             font-size: 14px;
         }
+
+        .joystick-container {
+            position: relative;
+            width: 200px;
+            height: 200px;
+            margin: 20px auto;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .joystick-knob {
+            position: absolute;
+            width: 60px;
+            height: 60px;
+            background: #4CAF50;
+            border-radius: 50%;
+            border: 3px solid white;
+            cursor: grab;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+            transition: none;
+            z-index: 10;
+        }
+
+        .joystick-knob.dragging {
+            cursor: grabbing;
+            box-shadow: 0 6px 12px rgba(0,0,0,0.5);
+        }
+
+        .crosshair {
+            position: absolute;
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .crosshair.horizontal {
+            width: 100%;
+            height: 1px;
+            top: 50%;
+        }
+
+        .crosshair.vertical {
+            width: 1px;
+            height: 100%;
+            left: 50%;
+        }
+
+        .joystick-labels {
+            position: absolute;
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.8);
+        }
+
+        .joystick-labels.top { top: 10px; left: 50%; transform: translateX(-50%); }
+        .joystick-labels.bottom { bottom: 10px; left: 50%; transform: translateX(-50%); }
+        .joystick-labels.left { left: 10px; top: 50%; transform: translateY(-50%); }
+        .joystick-labels.right { right: 10px; top: 50%; transform: translateY(-50%); }
     </style>
 </head>
 <body>
@@ -276,22 +363,34 @@ class PhoneGyroHandler(BaseHTTPRequestHandler):
             <h3>Status: <span id="status" class="disconnected">Disconnected</span></h3>
             <div id="position" class="data">Position: x=0, y=0, z=0</div>
             <div id="orientation" class="data">Orientation: roll=0, pitch=0, yaw=0</div>
+            <div id="joystick-pos" class="data">Joystick: x=0.00, y=0.00</div>
+        </div>
+
+        <div class="joystick-container" id="joystickContainer">
+            <div class="crosshair horizontal"></div>
+            <div class="crosshair vertical"></div>
+            <div class="joystick-labels top">FORWARD</div>
+            <div class="joystick-labels bottom">BACK</div>
+            <div class="joystick-labels left">LEFT</div>
+            <div class="joystick-labels right">RIGHT</div>
+            <div class="joystick-knob" id="joystickKnob"></div>
         </div>
 
         <div class="instructions">
-            <h4>📱 Instructions:</h4>
+            <h4>🕹️ Joystick Control:</h4>
+            <p>Drag the joystick to move robot left/right and forward/back</p>
+            <h4>📱 Gyro Control:</h4>
             <ul>
-                <li>Tilt phone <strong>left/right</strong> → Robot moves left/right</li>
-                <li>Tilt phone <strong>forward/back</strong> → Robot moves forward/back</li>
-                <li>Roll phone <strong>clockwise/counter</strong> → Robot moves up/down</li>
-                <li>Phone <strong>roll/pitch</strong> controls end-effector orientation</li>
+                <li>Phone <strong>pitch/roll</strong> controls wrist orientation</li>
+                <li>Tap to toggle gripper (green = closed, red = open)</li>
             </ul>
         </div>
 
         <div class="controls">
-            <button onclick="startControl()">Start Control</button>
-            <button onclick="calibrate()">Calibrate</button>
-            <button onclick="stopControl()" class="stop-button">Stop</button>
+            <button onclick="startControl()">🚀 Start Control</button>
+            <button onclick="calibrate()">🎯 Calibrate</button>
+            <button onclick="toggleGripper()" id="gripperBtn">✋ Gripper: Open</button>
+            <button onclick="stopControl()" class="stop-button">⛔ Stop</button>
         </div>
 
         <div id="debug" class="data"></div>
@@ -300,6 +399,16 @@ class PhoneGyroHandler(BaseHTTPRequestHandler):
     <script>
         let isControlling = false;
         let gyroInterval = null;
+        let gripperClosed = false;
+
+        // Joystick variables
+        let isDragging = false;
+        let joystickX = 0;
+        let joystickY = 0;
+        let containerRect = null;
+        let containerCenterX = 0;
+        let containerCenterY = 0;
+        let maxRadius = 0;
 
         function startControl() {
             if ('DeviceMotionEvent' in window) {
@@ -326,6 +435,9 @@ class PhoneGyroHandler(BaseHTTPRequestHandler):
             isControlling = true;
             document.getElementById('status').textContent = 'Connected';
             document.getElementById('status').className = 'connected';
+
+            // Initialize joystick
+            initJoystick();
 
             // Start listening to device motion
             window.addEventListener('devicemotion', handleMotion);
@@ -400,6 +512,115 @@ class PhoneGyroHandler(BaseHTTPRequestHandler):
                     console.error('Error calibrating:', error);
                     alert('Error calibrating');
                 });
+        }
+
+        function initJoystick() {
+            const joystickContainer = document.getElementById('joystickContainer');
+            const joystickKnob = document.getElementById('joystickKnob');
+
+            containerRect = joystickContainer.getBoundingClientRect();
+            containerCenterX = containerRect.left + containerRect.width / 2;
+            containerCenterY = containerRect.top + containerRect.height / 2;
+            maxRadius = containerRect.width / 2 - 30;
+
+            // Position knob at center initially
+            joystickKnob.style.left = (containerRect.width / 2 - 30) + 'px';
+            joystickKnob.style.top = (containerRect.height / 2 - 30) + 'px';
+
+            // Mouse events
+            joystickKnob.addEventListener('mousedown', startDrag);
+            document.addEventListener('mousemove', drag);
+            document.addEventListener('mouseup', stopDrag);
+
+            // Touch events
+            joystickKnob.addEventListener('touchstart', startDrag);
+            document.addEventListener('touchmove', drag);
+            document.addEventListener('touchend', stopDrag);
+
+            // Update on window resize
+            window.addEventListener('resize', initJoystick);
+        }
+
+        function startDrag(e) {
+            isDragging = true;
+            document.getElementById('joystickKnob').classList.add('dragging');
+            e.preventDefault();
+        }
+
+        function drag(e) {
+            if (!isDragging) return;
+
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+            const dx = clientX - containerCenterX;
+            const dy = clientY - containerCenterY;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+
+            if (distance <= maxRadius) {
+                joystickX = dx / maxRadius;
+                joystickY = -dy / maxRadius; // Invert Y for intuitive control
+                document.getElementById('joystickKnob').style.left = (containerRect.width / 2 + dx - 30) + 'px';
+                document.getElementById('joystickKnob').style.top = (containerRect.height / 2 + dy - 30) + 'px';
+            } else {
+                const angle = Math.atan2(dy, dx);
+                joystickX = Math.cos(angle);
+                joystickY = -Math.sin(angle); // Invert Y
+                document.getElementById('joystickKnob').style.left = (containerRect.width / 2 + Math.cos(angle) * maxRadius - 30) + 'px';
+                document.getElementById('joystickKnob').style.top = (containerRect.height / 2 + Math.sin(angle) * maxRadius - 30) + 'px';
+            }
+
+            // Update display and send data
+            document.getElementById('joystick-pos').textContent = `Joystick: x=${joystickX.toFixed(2)}, y=${joystickY.toFixed(2)}`;
+            sendJoystickData();
+        }
+
+        function stopDrag() {
+            if (!isDragging) return;
+
+            isDragging = false;
+            document.getElementById('joystickKnob').classList.remove('dragging');
+
+            // Reset joystick to center
+            joystickX = 0;
+            joystickY = 0;
+            document.getElementById('joystickKnob').style.left = (containerRect.width / 2 - 30) + 'px';
+            document.getElementById('joystickKnob').style.top = (containerRect.height / 2 - 30) + 'px';
+            document.getElementById('joystick-pos').textContent = 'Joystick: x=0.00, y=0.00';
+            sendJoystickData();
+        }
+
+        function sendJoystickData() {
+            const data = {
+                joystick: {
+                    x: joystickX,
+                    y: joystickY
+                },
+                gripper_closed: gripperClosed
+            };
+
+            fetch('/joystick', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data)
+            }).catch(error => {
+                console.error('Error sending joystick data:', error);
+            });
+        }
+
+        function toggleGripper() {
+            gripperClosed = !gripperClosed;
+            const btn = document.getElementById('gripperBtn');
+            if (gripperClosed) {
+                btn.textContent = '✊ Gripper: Closed';
+                btn.style.backgroundColor = '#4CAF50';
+            } else {
+                btn.textContent = '✋ Gripper: Open';
+                btn.style.backgroundColor = '#f44336';
+            }
+            sendJoystickData();
         }
 
         function updateStatus() {

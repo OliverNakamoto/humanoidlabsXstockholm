@@ -14,11 +14,11 @@ import numpy as np
 from typing import Dict, Optional, Tuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Import IK functions from keyboard_teleop
+# Import IK functions from phone_gyro teleoperator
 import sys
-sys.path.append('keyboard_teleop')
-from forward_kinematics import forward_kinematics
-from inverse_kinematics import iterative_ik
+sys.path.append('lerobot/src/lerobot/teleoperators/phone_gyro')
+from .forward_kinematics import forward_kinematics
+from .inverse_kinematics import iterative_ik
 
 # Import ngrok
 try:
@@ -522,15 +522,16 @@ def start_server_with_ngrok():
 
     print(f"Server started on http://localhost:{server_port}")
 
-    # Setup ngrok
+    # Setup ngrok tunnel
+    public_url = None
     if NGROK_AVAILABLE:
         try:
-            # Configure ngrok
-            ngrok.set_auth_token(NGROK_AUTHTOKEN)
+            # Set ngrok auth token
+            ngrok.conf.get_default().auth_token = NGROK_AUTHTOKEN
 
-            # Create tunnel
-            tunnel = ngrok.connect(server_port, "http")
-            public_url = tunnel.url()
+            # Create ngrok tunnel
+            tunnel = ngrok.connect(addr=server_port, proto="http")
+            public_url = tunnel.public_url
 
             print("\n" + "="*50)
             print("Robot IK Joystick Control")
@@ -538,15 +539,23 @@ def start_server_with_ngrok():
             print(f"Local URL: http://localhost:{server_port}")
             print(f"Public URL: {public_url}")
             print("="*50)
-            print("\nOpen the URL on your phone to control the robot")
+            print(f"\n✅ Open this URL on your phone: {public_url}")
             print("Drag the joystick for smooth IK-based movement")
             print("\nPress Ctrl+C to stop")
 
         except Exception as e:
-            print(f"Ngrok error: {e}")
-            print("Server running on localhost only")
+            print(f"Failed to create ngrok tunnel: {e}")
+            print("Falling back to local server only")
+            print(f"Local URL: http://localhost:{server_port}")
     else:
-        print("Ngrok not available - localhost only")
+        print("\n" + "="*50)
+        print("Robot IK Joystick Control")
+        print("="*50)
+        print(f"Local URL: http://localhost:{server_port}")
+        print("="*50)
+        print("\nOpen the URL on your phone to control the robot")
+        print("Drag the joystick for smooth IK-based movement")
+        print("\nPress Ctrl+C to stop")
 
     # Keep running
     try:
@@ -555,8 +564,11 @@ def start_server_with_ngrok():
     except KeyboardInterrupt:
         print("\nShutting down...")
         server.shutdown()
-        if NGROK_AVAILABLE:
-            ngrok.disconnect(public_url)
+        if NGROK_AVAILABLE and public_url:
+            try:
+                ngrok.disconnect(public_url)
+            except:
+                pass
 
 
 if __name__ == "__main__":
