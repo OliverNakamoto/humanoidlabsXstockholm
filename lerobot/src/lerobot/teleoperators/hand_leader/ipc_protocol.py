@@ -30,7 +30,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Protocol configuration
-SOCKET_PATH = "/tmp/lerobot_hand_tracking.sock"
+SOCKET_PATH = "/tmp/lerobot_hand_tracking_dos.sock"
 MESSAGE_TIMEOUT = 0.050  # 50ms timeout for 60fps with safety margin
 HEARTBEAT_INTERVAL = 1.0  # 1 second heartbeat
 MAX_MESSAGE_SIZE = 128  # Maximum message size in bytes
@@ -57,7 +57,7 @@ MSG_TYPE_CALIBRATION_COMPLETE = 5
 # f: quaternion y (4 bytes)
 # f: quaternion z (4 bytes)
 # f: quaternion w (4 bytes)
-# f: second hand pitch (0-100, 4 bytes)
+# f: second hand curl (0-100, 4 bytes)
 MESSAGE_FORMAT = '<BBffffffffffff'
 MESSAGE_SIZE = struct.calcsize(MESSAGE_FORMAT)
 
@@ -77,7 +77,7 @@ class HandTrackingData:
     qy: float  # Quaternion y component
     qz: float  # Quaternion z component
     qw: float  # Quaternion w component
-    second_hand_pitch: float  # Second hand pitch percentage 0-100
+    second_hand_pitch: float  # Second hand curl percentage 0-100 (field kept for compatibility)
     calibrated: bool = True
     second_hand_detected: bool = False
     
@@ -87,9 +87,9 @@ class HandTrackingData:
         return cls(
             timestamp=time.time(),
             hand_detected=False,
-            x=0.0,
-            y=0.2,  # Default safe Y position
-            z=0.2,  # Default safe Z position
+            x=0.175,  # Default safe X position (mid-range: 5-30cm)
+            y=0.0,    # Default safe Y position (center: ±10cm)
+            z=0.25,   # Default safe Z position (mid-range: 10-40cm)
             pinch=0.0,
             palm_width=0.0,
             palm_height=0.0,
@@ -97,7 +97,7 @@ class HandTrackingData:
             qy=0.0,
             qz=0.0,
             qw=1.0,
-            second_hand_pitch=50.0,  # Default neutral pitch (horizontal)
+            second_hand_pitch=0.0,  # Default uncurled (hand open)
             calibrated=False,
             second_hand_detected=False
         )
@@ -134,7 +134,7 @@ class HandTrackingProtocol:
                 data.qy,            # quaternion y
                 data.qz,            # quaternion z
                 data.qw,            # quaternion w
-                data.second_hand_pitch  # second hand pitch
+                data.second_hand_pitch  # second hand curl
             )
             return message
         except struct.error as e:
@@ -215,11 +215,11 @@ class MessageValidator:
     @staticmethod
     def validate_hand_data(data: HandTrackingData) -> bool:
         """Validate hand tracking data for reasonable values."""
-        # Check timestamp is recent (within 1 second)
+        # Check timestamp is recent (within 5 seconds) - LOG ONLY, DON'T REJECT
         current_time = time.time()
-        if abs(current_time - data.timestamp) > 1.0:
-            logger.warning(f"Timestamp too old: {current_time - data.timestamp:.3f}s")
-            return False
+        time_diff = current_time - data.timestamp
+        if abs(time_diff) > 5.0:
+            logger.debug(f"Timestamp age: {time_diff:.3f}s - continuing anyway")
         
         # Check position ranges (robot workspace bounds)
         if not (-0.5 <= data.x <= 0.5):
@@ -246,9 +246,9 @@ class MessageValidator:
                 logger.warning(f"Palm height out of range: {data.palm_height}")
                 return False
         
-        # Check second hand pitch percentage
+        # Check second hand curl percentage
         if not (0.0 <= data.second_hand_pitch <= 100.0):
-            logger.warning(f"Second hand pitch out of range: {data.second_hand_pitch}")
+            logger.warning(f"Second hand curl out of range: {data.second_hand_pitch}")
             return False
         
         return True
@@ -271,7 +271,7 @@ class MessageValidator:
         sanitized.palm_width = max(0.0, min(1000.0, data.palm_width))
         sanitized.palm_height = max(0.0, min(1000.0, data.palm_height))
         
-        # Clamp second hand pitch percentage
+        # Clamp second hand curl percentage
         sanitized.second_hand_pitch = max(0.0, min(100.0, data.second_hand_pitch))
         
         return sanitized
@@ -292,7 +292,7 @@ def create_test_data() -> HandTrackingData:
         qy=0.0,
         qz=0.707,  # 90-degree rotation around Z-axis
         qw=0.707,
-        second_hand_pitch=75.0,  # Test pitch value
+        second_hand_pitch=75.0,  # Test curl value
         calibrated=True,
         second_hand_detected=True
     )

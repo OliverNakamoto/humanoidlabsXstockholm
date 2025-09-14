@@ -72,11 +72,11 @@ class MediaPipeHandTracker:
         self.palm_bbox_near = None  # Palm bounding box when hand is near
         self.initial_thumb_index_dist = None  # Initial distance for pinch normalization
         
-        # Workspace bounds (robot coordinate system)
+        # Workspace bounds (robot coordinate system) - FIXED PHYSICAL DIMENSIONS
         self.workspace_bounds = {
-            'x_min': -0.3, 'x_max': 0.3,  # meters
-            'y_min': 0.1, 'y_max': 0.5,   # meters  
-            'z_min': 0.1, 'z_max': 0.4    # meters
+            'x_min': 0.10, 'x_max': 0.30,  # 5cm to 30cm forward (25cm range)
+            'y_min': -0.10, 'y_max': 0.10, # ±10cm left/right (20cm range)
+            'z_min': 0.10, 'z_max': 0.40   # 10cm to 40cm height (30cm range)
         }
         
         # Current tracking state
@@ -88,10 +88,11 @@ class MediaPipeHandTracker:
         self.prev_euler = np.array([0.0, 0.0, 0.0])  # Previous Euler angles for EMA smoothing
         self.orientation_ema_alpha = 0.3  # EMA smoothing factor (lower = more smoothing)
         
-        # Second hand tracking (for pitch control)
-        self.second_hand_pitch = 50.0  # Default neutral pitch (horizontal)
-        self.prev_second_hand_pitch = 50.0  # Previous pitch for EMA smoothing
-        self.second_hand_pitch_ema_alpha = 0.4  # EMA smoothing for pitch
+        # Second hand tracking (for curl control)
+        self.second_hand_curl = 0.0  # Default uncurled (hand open)
+        self.prev_second_hand_curl = 0.0  # Previous curl for EMA smoothing
+        self.second_hand_curl_ema_alpha = 0.4  # EMA smoothing for curl
+
     
     @staticmethod
     def _build_orthonormal_basis(wrist, index_mcp, pinky_mcp):
@@ -519,48 +520,92 @@ class MediaPipeHandTracker:
             'palm_height': palm_height
         }
     
-    def _calculate_hand_pitch(self, landmarks) -> float:
-        """Calculate hand pitch angle from MediaPipe landmarks.
-        
+    def _calculate_hand_curl(self, landmarks) -> float:
+        """Calculate hand curl percentage from MediaPipe landmarks.
+
         Args:
             landmarks: MediaPipe hand landmarks
-            
+
         Returns:
-            Pitch percentage (0-100) where:
-            - 0% = hand pointing down (-90°)
-            - 50% = hand horizontal (0°)
-            - 100% = hand pointing up (+90°)
+            Curl percentage (0-100) where:
+            - 0% = hand fully open (fingers extended)
+            - 100% = hand fully curled (fingers curled into fist)
+            - Maps to wrist_flex joint range (-10° to +90°)
         """
         try:
-            # Use wrist, index MCP, and pinky MCP for orientation
-            wrist = np.array([landmarks.landmark[0].x, landmarks.landmark[0].y, landmarks.landmark[0].z])
-            index_mcp = np.array([landmarks.landmark[5].x, landmarks.landmark[5].y, landmarks.landmark[5].z])  
-            pinky_mcp = np.array([landmarks.landmark[17].x, landmarks.landmark[17].y, landmarks.landmark[17].z])
-            
-            # Build orthonormal basis
-            R = self._build_orthonormal_basis(wrist, index_mcp, pinky_mcp)
-            
-            # Extract pitch angle from rotation matrix
-            # Pitch is rotation around Y-axis, extract from R[2,0] (forward Z component)
-            pitch_radians = np.arcsin(-np.clip(R[2, 0], -1.0, 1.0))
-            
-            # Convert to 0-100 percentage
-            # -π/2 (-90°) -> 0%, 0° -> 50%, π/2 (90°) -> 100%
-            pitch_degrees = np.degrees(pitch_radians)
-            pitch_percentage = 50.0 + (pitch_degrees / 90.0) * 50.0
-            pitch_percentage = np.clip(pitch_percentage, 0.0, 100.0)
-            
+            # MediaPipe hand landmark indices for finger joints
+            # Index finger: MCP=5, PIP=6, DIP=7, TIP=8
+            # Middle finger: MCP=9, PIP=10, DIP=11, TIP=12
+            # Ring finger: MCP=13, PIP=14, DIP=15, TIP=16
+            # Pinky finger: MCP=17, PIP=18, DIP=19, TIP=20
+
+            finger_curl_scores = []
+
+            # Calculate curl for each finger (excluding thumb)
+            fingers = [
+                [5, 6, 7, 8],    # Index finger
+                [9, 10, 11, 12], # Middle finger
+                [13, 14, 15, 16], # Ring finger
+                [17, 18, 19, 20]  # Pinky finger
+            ]
+
+            for finger_indices in fingers:
+                mcp_idx, pip_idx, dip_idx, tip_idx = finger_indices
+
+                # Get landmark positions
+                mcp = np.array([landmarks.landmark[mcp_idx].x, landmarks.landmark[mcp_idx].y])
+                pip = np.array([landmarks.landmark[pip_idx].x, landmarks.landmark[pip_idx].y])
+                dip = np.array([landmarks.landmark[dip_idx].x, landmarks.landmark[dip_idx].y])
+                tip = np.array([landmarks.landmark[tip_idx].x, landmarks.landmark[tip_idx].y])
+
+                # Calculate vectors between joints
+                mcp_to_pip = pip - mcp
+                pip_to_dip = dip - pip
+                dip_to_tip = tip - dip
+
+                # Calculate angles between joint segments
+                angle1 = self._calculate_angle_between_vectors(mcp_to_pip, pip_to_dip)
+                angle2 = self._calculate_angle_between_vectors(pip_to_dip, dip_to_tip)
+
+                # Convert angles to curl score (0 = straight, 1 = fully curled)
+                # Smaller angles (more bent) = higher curl score
+                curl_score1 = max(0, (np.pi - angle1) / np.pi)  # 0 when straight (π), 1 when bent (0)
+                curl_score2 = max(0, (np.pi - angle2) / np.pi)
+
+                # Average the two joint curl scores for this finger
+                finger_curl = (curl_score1 + curl_score2) / 2.0
+                finger_curl_scores.append(finger_curl)
+
+            # Calculate overall curl as average of all fingers
+            overall_curl = np.mean(finger_curl_scores) * 100.0  # Convert to percentage
+
+            # Clamp to 0-100 range
+            overall_curl = np.clip(overall_curl, 0.0, 100.0)
+
             # Apply EMA smoothing
-            self.prev_second_hand_pitch = (
-                self.second_hand_pitch_ema_alpha * pitch_percentage +
-                (1.0 - self.second_hand_pitch_ema_alpha) * self.prev_second_hand_pitch
+            self.prev_second_hand_curl = (
+                self.second_hand_curl_ema_alpha * overall_curl +
+                (1.0 - self.second_hand_curl_ema_alpha) * self.prev_second_hand_curl
             )
-            
-            return self.prev_second_hand_pitch
-            
+
+            return self.prev_second_hand_curl
+
         except Exception as e:
-            logger.debug(f"Failed to calculate hand pitch: {e}")
-            return 50.0  # Default horizontal pitch
+            logger.debug(f"Failed to calculate hand curl: {e}")
+            return 0.0  # Default to uncurled (open hand)
+
+    @staticmethod
+    def _calculate_angle_between_vectors(v1, v2):
+        """Calculate angle between two 2D vectors."""
+        # Normalize vectors
+        v1_norm = v1 / (np.linalg.norm(v1) + 1e-8)
+        v2_norm = v2 / (np.linalg.norm(v2) + 1e-8)
+
+        # Calculate angle using dot product
+        dot_product = np.clip(np.dot(v1_norm, v2_norm), -1.0, 1.0)
+        angle = np.arccos(dot_product)
+
+        return angle
     
     def process_frame(self) -> HandTrackingData:
         """Process single frame and return dual hand tracking data."""
@@ -582,7 +627,7 @@ class MediaPipeHandTracker:
         # Initialize default values
         primary_hand = None
         second_hand = None
-        second_hand_pitch = 50.0  # Default horizontal
+        second_hand_curl = 0.0  # Default uncurled (open hand)
         second_hand_detected = False
         
         # Store handedness info for visualization
@@ -603,7 +648,7 @@ class MediaPipeHandTracker:
                         handedness_confidence = handedness.classification[0].score
                 
                 # Right hand = Primary hand (position + orientation)
-                # Left hand = Secondary hand (pitch control)
+                # Left hand = Secondary hand (curl control)
                 if handedness_label == "Right":
                     primary_hand = landmarks
                     primary_hand_info = {"confidence": handedness_confidence, "landmarks": landmarks}
@@ -628,7 +673,7 @@ class MediaPipeHandTracker:
             norm_x = palm_data['center'][0] / w
             norm_y = 1.0 - (palm_data['center'][1] / h)  # Invert Y
             
-            # Calculate Z from palm size (near = larger bbox)
+            # Calculate Z from palm size (near = larger bbox) - CALIBRATED
             palm_size = palm_data['palm_width']
             if self.palm_bbox_near > self.palm_bbox_far:
                 # Normalize Z: far=0, near=1
@@ -653,9 +698,12 @@ class MediaPipeHandTracker:
             else:
                 pinch = 0.0
             
-            # Convert normalized coordinates to robot workspace
-            x = self.workspace_bounds['x_min'] + norm_x * (self.workspace_bounds['x_max'] - self.workspace_bounds['x_min'])
-            y = self.workspace_bounds['y_min'] + norm_y * (self.workspace_bounds['y_max'] - self.workspace_bounds['y_min'])
+            # Convert normalized coordinates to robot workspace with correct axis mapping:
+            # CV X (horizontal) → Robot Y (left/right)
+            # CV Y (vertical) → Robot X (forward/backward)
+            # CV Z (depth) → Robot Z (height)
+            x = self.workspace_bounds['x_min'] + norm_y * (self.workspace_bounds['x_max'] - self.workspace_bounds['x_min'])
+            y = self.workspace_bounds['y_min'] + norm_x * (self.workspace_bounds['y_max'] - self.workspace_bounds['y_min'])
             z = self.workspace_bounds['z_min'] + norm_z * (self.workspace_bounds['z_max'] - self.workspace_bounds['z_min'])
             
             # Calculate hand orientation
@@ -669,16 +717,16 @@ class MediaPipeHandTracker:
             hand_detected = True
             
         else:
-            # No primary hand detected - use defaults
-            x, y, z = 0.0, 0.2, 0.2
+            # No primary hand detected - use defaults (center of workspace)
+            x, y, z = 0.175, 0.0, 0.25  # Mid-range for each axis
             pinch = 0.0
             qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0  # Identity quaternion
             palm_data = {'palm_width': 0.0, 'palm_height': 0.0, 'bbox': (0, 0, 0, 0), 'center': (0, 0)}
             hand_detected = False
         
-        # Process second hand (pitch control)
+        # Process second hand (curl control)
         if second_hand is not None:
-            second_hand_pitch = self._calculate_hand_pitch(second_hand)
+            second_hand_curl = self._calculate_hand_curl(second_hand)
         
         # Draw visualization if requested
         if self.show_window and display_frame is not None:
@@ -720,25 +768,90 @@ class MediaPipeHandTracker:
                 cv2.putText(display_frame, label_text, (wrist_x - 50, wrist_y - 20), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
             
-            # Display tracking info
+            # Display detailed tracking info
+            y_offset = 25
+            font_scale = 0.5
+            thickness = 1
+
+            # Frame info
+            frame_text = f"Frame: {w}x{h} pixels"
+            cv2.putText(display_frame, frame_text, (10, y_offset),
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+            y_offset += 25
+
             if hand_detected:
-                info_text = f"Right Hand: ({x:.3f}, {y:.3f}, {z:.3f}) Pinch: {pinch:.1f}%"
-                cv2.putText(display_frame, info_text, (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
+                # Right hand detailed info
+                palm_center = palm_data['center']
+                cv2.putText(display_frame, "RIGHT HAND (Position Control):", (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness)
+                y_offset += 20
+
+                pixel_text = f"  Pixel: ({palm_center[0]}, {palm_center[1]})"
+                cv2.putText(display_frame, pixel_text, (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness)
+                y_offset += 20
+
+                norm_text = f"  Normalized: ({norm_x:.3f}, {norm_y:.3f}, {norm_z:.3f})"
+                cv2.putText(display_frame, norm_text, (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness)
+                y_offset += 20
+
+                robot_text = f"  Robot: ({x:.3f}, {y:.3f}, {z:.3f})m"
+                cv2.putText(display_frame, robot_text, (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness)
+                y_offset += 20
+
+                pinch_text = f"  Pinch: {pinch:.1f}%"
+                cv2.putText(display_frame, pinch_text, (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness)
+                y_offset += 25
+
             if second_hand_detected:
-                pitch_text = f"Left Hand Pitch: {second_hand_pitch:.1f}%"
-                cv2.putText(display_frame, pitch_text, (10, 60), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                # Left hand detailed info
+                cv2.putText(display_frame, "LEFT HAND (Curl Control):", (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thickness)
+                y_offset += 20
+
+                curl_text = f"  Curl: {second_hand_curl:.1f}%"
+                cv2.putText(display_frame, curl_text, (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thickness)
+                y_offset += 25
+
+            # Draw frame center crosshair for reference
+            center_x, center_y = w // 2, h // 2
+            crosshair_size = 20
+            # Horizontal line
+            cv2.line(display_frame, (center_x - crosshair_size, center_y),
+                    (center_x + crosshair_size, center_y), (255, 255, 255), 1)
+            # Vertical line
+            cv2.line(display_frame, (center_x, center_y - crosshair_size),
+                    (center_x, center_y + crosshair_size), (255, 255, 255), 1)
+
+            # Label the center
+            cv2.putText(display_frame, f"Center ({center_x},{center_y})",
+                       (center_x + 25, center_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
             
+            # Status messages
             if not self.calibrated:
-                cv2.putText(display_frame, "NOT CALIBRATED - Right hand for position, Left hand for pitch", (10, 90), 
+                cv2.putText(display_frame, "NOT CALIBRATED - Right hand for position, Left hand for curl", (10, y_offset),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
             elif not hand_detected and not second_hand_detected:
-                cv2.putText(display_frame, "Show hands: Right=Position/Grip, Left=Pitch", (10, 90), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                cv2.putText(display_frame, "Show hands: Right=Position/Grip, Left=Curl", (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+            # Add coordinate mapping explanation in bottom right
+            mapping_lines = [
+                "Coordinate Mapping:",
+                "X (left/right) → Robot Y (±10cm)",
+                "Y (up/down) → Robot X (5-30cm)",
+                "Z (depth) → Robot Z (height)"
+            ]
+
+            for i, line in enumerate(mapping_lines):
+                cv2.putText(display_frame, line, (w - 300, h - 80 + i*15),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
         
-        # Create result with all data including second hand pitch
+        # Create result with all data including second hand curl
         result = HandTrackingData(
             timestamp=time.time(),
             hand_detected=hand_detected,
@@ -752,7 +865,7 @@ class MediaPipeHandTracker:
             qy=qy,
             qz=qz,
             qw=qw,
-            second_hand_pitch=second_hand_pitch,
+            second_hand_pitch=second_hand_curl,
             calibrated=self.calibrated,
             second_hand_detected=second_hand_detected
         )
@@ -793,9 +906,13 @@ class HandTrackingServer:
     def start(self, camera_index: int = 0, show_window: bool = False) -> bool:
         """Start the hand tracking server."""
         try:
-            # Remove existing socket file
+            # Force remove existing socket file (cleanup from previous runs)
             if os.path.exists(self.socket_path):
-                os.unlink(self.socket_path)
+                try:
+                    os.unlink(self.socket_path)
+                    logger.info(f"Removed stale socket file: {self.socket_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove stale socket: {e}")
             
             # Create Unix domain socket
             self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)

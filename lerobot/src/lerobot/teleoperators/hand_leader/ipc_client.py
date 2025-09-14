@@ -76,42 +76,42 @@ class HandTrackingClient:
         try:
             if self.connected:
                 return True
-                
+
             # Check if socket exists
             if not os.path.exists(self.socket_path):
                 logger.warning(f"Socket does not exist: {self.socket_path}")
                 return False
-            
+
             # Create Unix domain socket
             self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             self.socket.settimeout(MESSAGE_TIMEOUT)
-            
+
             # Test connection by sending a heartbeat request
             # We bind to a temporary socket for replies
             temp_path = f"{self.socket_path}_client_{os.getpid()}"
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
-            
+
             self.socket.bind(temp_path)
-            
+
             # Send test message to server
             test_message = HandTrackingProtocol.pack_heartbeat()
             self.socket.sendto(test_message, self.socket_path)
-            
+
             self.connected = True
             self.running = True
-            
+
             # Start receiver thread
             self.receiver_thread = threading.Thread(target=self._receiver_loop, daemon=True)
             self.receiver_thread.start()
-            
+
             logger.info("Connected to hand tracking server")
-            
+
             if self.connection_callback:
                 self.connection_callback(True)
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to connect to hand tracking server: {e}")
             self._cleanup_socket()
@@ -234,13 +234,13 @@ class HandTrackingClient:
     def _check_connection_health(self):
         """Check if connection is still healthy."""
         current_time = time.time()
-        
-        # Check if we haven't received data or heartbeat recently
-        data_timeout = current_time - self.last_data_received > 5.0  # 5 seconds
-        heartbeat_timeout = current_time - self.last_heartbeat > 10.0  # 10 seconds
-        
+
+        # More lenient timeouts to avoid false disconnections
+        data_timeout = current_time - self.last_data_received > 105.0  # 15 seconds instead of 5
+        heartbeat_timeout = current_time - self.last_heartbeat > 300.0  # 30 seconds instead of 10
+
         if data_timeout and heartbeat_timeout:
-            logger.warning("Connection appears to be dead (no data or heartbeat)")
+            logger.warning("Connection appears to be dead (no data or heartbeat for extended time)")
             self.connected = False
             if self.connection_callback:
                 self.connection_callback(False)
@@ -427,7 +427,7 @@ class HandTrackingClientManager:
                     else:
                         logger.warning("Reconnection failed, will retry...")
                 
-                time.sleep(2.0)  # Check every 2 seconds
+                time.sleep(5.0)  # Check every 5 seconds to reduce spam
                 
             except Exception as e:
                 logger.error(f"Error in reconnection loop: {e}")

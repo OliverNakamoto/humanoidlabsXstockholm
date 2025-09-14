@@ -87,6 +87,7 @@ class HandTrackingProcessManager:
             self.command.append("--show-window")
         
         logger.info(f"Tracking process command: {' '.join(self.command)}")
+        # logger.info(1/0)
     
     def start(self) -> bool:
         """Start the MediaPipe tracking process."""
