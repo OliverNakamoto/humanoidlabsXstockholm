@@ -72,7 +72,7 @@ from lerobot.robots import (  # noqa: F401
     so101_follower,
 )
 # Import mock robot for testing
-from tests.mocks.mock_so101_robot import MockSO101Robot, MockSO101Config  # noqa: F401
+# from tests.mocks.mock_so101_robot import MockSO101Robot, MockSO101Config  # noqa: F401
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -87,8 +87,9 @@ from lerobot.teleoperators import (  # noqa: F401
 )
 # Import hand leader for CV tracking
 from lerobot.teleoperators.hand_leader import HandLeader, HandLeaderConfig  # noqa: F401
-# Import phone gyro teleoperator
+# Import phone teleoperators to register their configs
 from lerobot.teleoperators.phone_gyro import PhoneGyro, PhoneGyroConfig  # noqa: F401
+from lerobot.teleoperators.phone_leader import config_phone_leader, phone_leader  # noqa: F401
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import _init_rerun, log_rerun_data

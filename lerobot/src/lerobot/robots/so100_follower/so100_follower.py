@@ -216,6 +216,14 @@ class SO100Follower(Robot):
         self.bus.sync_write("Goal_Position", goal_pos)
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
 
+    def get_pos(self) -> dict[str, float]:
+        """Get current motor positions - required by teleoperate.py"""
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        present_pos = self.bus.sync_read("Present_Position")
+        return {f"{motor}.pos": val for motor, val in present_pos.items()}
+
     def disconnect(self):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")

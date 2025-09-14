@@ -18,10 +18,28 @@ import logging
 import time
 import numpy as np
 import requests
+import os
 from typing import Dict, Tuple
 from scipy.spatial.transform import Rotation
 
 from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+
+# Import IK functions from keyboard_teleop
+import sys
+keyboard_teleop_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '..', 'keyboard_teleop')
+if os.path.exists(keyboard_teleop_path):
+    sys.path.insert(0, keyboard_teleop_path)
+    try:
+        from forward_kinematics import forward_kinematics
+        from inverse_kinematics import iterative_ik
+        HAS_KEYBOARD_IK = True
+        logging.info("Loaded keyboard_teleop IK functions")
+    except ImportError as e:
+        HAS_KEYBOARD_IK = False
+        logging.warning(f"Could not load keyboard_teleop IK functions: {e}")
+else:
+    HAS_KEYBOARD_IK = False
+    logging.warning("keyboard_teleop folder not found")
 
 try:
     from lerobot.model.kinematics import RobotKinematics
@@ -71,6 +89,14 @@ class PhoneGyro(Teleoperator):
 
         # HTTP session for requests
         self.session = requests.Session()
+
+        # Current end-effector position for incremental IK (like keyboard_teleop)
+        self.ef_position = np.array([0.2, 0.0, 0.15])  # Default start position
+        self.ef_pitch = 90.0  # Default pitch angle
+        self.current_angles = [0.0, 0.0, 0.0, 0.0]  # Current joint angles
+
+        # Movement step size (same as keyboard_teleop)
+        self.step_size = 0.005
 
         # Define joint limits (in normalized range -100 to 100)
         self.joint_limits = {
@@ -158,12 +184,12 @@ class PhoneGyro(Teleoperator):
         except Exception as e:
             logger.error(f"Calibration error: {e}")
 
-    def get_phone_pose(self) -> Tuple[float, float, float, float, float, float, bool]:
+    def get_phone_pose(self) -> Tuple[float, float, float, float, float, float, bool, float, float, float]:
         """
-        Get current phone pose from server.
+        Get current phone pose, acceleration, and joystick from server.
 
         Returns:
-            Tuple of (x, y, z, roll, pitch, yaw, gripper_closed) in robot coordinates
+            Tuple of (x, y, z, roll, pitch, yaw, gripper_closed, accel_x, joystick_x, joystick_y) in robot coordinates
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
@@ -181,161 +207,164 @@ class PhoneGyro(Teleoperator):
                     y = pos['y'] * self.config.position_scale
                     z = pos['z'] * self.config.position_scale
 
+                    # Transform orientation for portrait phone mode (phone held upright)
+                    # When phone is held upright (portrait), we need to offset the pitch by -90 degrees
+                    # so that "flat" phone orientation corresponds to neutral robot orientation
                     roll = np.radians(ori['roll']) * self.config.orientation_scale
-                    pitch = np.radians(ori['pitch']) * self.config.orientation_scale
+                    pitch = np.radians(ori['pitch'] + 90.0) * self.config.orientation_scale  # Add 90° offset for portrait mode
                     yaw = np.radians(ori['yaw']) * self.config.orientation_scale
 
                     # Get gripper state
                     gripper_closed = data.get('gripper_closed', False)
 
-                    return (x, y, z, roll, pitch, yaw, gripper_closed)
+                    # Get acceleration data
+                    accel = data.get('acceleration', {'x': 0.0})
+                    accel_x = accel.get('x', 0.0)
+
+                    # Get joystick data
+                    joystick = data.get('joystick', {'x': 0.0, 'y': 0.0})
+                    joystick_x = joystick.get('x', 0.0)
+                    joystick_y = joystick.get('y', 0.0)
+
+                    return (x, y, z, roll, pitch, yaw, gripper_closed, accel_x, joystick_x, joystick_y)
 
         except Exception as e:
             logger.debug(f"Error getting phone pose: {e}")
 
-        # Return default pose if no data (gripper open by default)
-        return (0.0, 0.2, 0.15, 0.0, 0.0, 0.0, False)
+        # Return default pose if no data (gripper open by default, no acceleration, no joystick)
+        return (0.0, 0.2, 0.15, 0.0, 0.0, 0.0, False, 0.0, 0.0, 0.0)
 
     def compute_ik(self, current_pos: Dict[str, float]) -> Dict[str, float]:
         """
-        Compute inverse kinematics from phone pose to joint angles.
+        Compute incremental IK control from joystick and phone data.
 
         Args:
-            current_pos: Current joint positions (used as IK seed)
+            current_pos: Current joint positions (used for initialization)
 
         Returns:
             Dictionary of joint positions
         """
-        # Get phone pose and gripper state
-        x, y, z, roll, pitch, yaw, gripper_closed = self.get_phone_pose()
+        # Get phone pose, gripper state, acceleration, and joystick
+        x, y, z, roll, pitch, yaw, gripper_closed, accel_x, joystick_x, joystick_y = self.get_phone_pose()
 
-        if self.use_ik:
-            # Create target transformation matrix for IK
-            target_pose = np.eye(4)
+        # Use incremental IK control (like keyboard_teleop)
+        return self.incremental_ik_control(
+            joystick_x=joystick_x,
+            joystick_y=joystick_y,
+            pitch=pitch,
+            roll=roll,
+            gripper_closed=gripper_closed
+        )
 
-            # Set position
-            target_pose[0, 3] = x
-            target_pose[1, 3] = y
-            target_pose[2, 3] = z
-
-            # Set orientation using rotation matrix
-            rotation = Rotation.from_euler('xyz', [roll, pitch, yaw])
-            target_pose[:3, :3] = rotation.as_matrix()
-
-            # Extract current joint values for IK seed
-            current_joints = []
-            for joint_name in self.config.joint_names:
-                key = f"{joint_name}.pos"
-                if key in current_pos:
-                    # Convert from normalized range to degrees if needed
-                    if self.config.use_degrees:
-                        current_joints.append(current_pos[key])
-                    else:
-                        # Convert from [-100, 100] to degrees
-                        min_deg, max_deg = (-90, 90)  # Default limits
-                        norm_val = current_pos[key]
-                        deg_val = min_deg + (norm_val + 100) * (max_deg - min_deg) / 200
-                        current_joints.append(deg_val)
-                else:
-                    current_joints.append(0.0)  # Default position
-
-            current_joints = np.array(current_joints)
-
-            # Compute IK
-            try:
-                joint_solution = self.kinematics.inverse_kinematics(
-                    current_joints,
-                    target_pose,
-                    position_weight=1.0,
-                    orientation_weight=0.5
-                )
-
-                # Convert joint angles back to normalized range
-                actions = {}
-                for i, joint_name in enumerate(self.config.joint_names):
-                    if i < len(joint_solution):
-                        if self.config.use_degrees:
-                            actions[f"{joint_name}.pos"] = float(joint_solution[i])
-                        else:
-                            # Convert from degrees to [-100, 100] range
-                            deg_val = joint_solution[i]
-                            min_deg, max_deg = (-90, 90)  # Default limits
-                            norm_val = 200 * (deg_val - min_deg) / (max_deg - min_deg) - 100
-                            norm_val = np.clip(norm_val, -100, 100)
-                            actions[f"{joint_name}.pos"] = float(norm_val)
-
-                # Gripper control from phone button
-                actions["gripper.pos"] = 100.0 if gripper_closed else 0.0
-
-                return actions
-
-            except Exception as e:
-                logger.warning(f"IK failed: {e}, using simple mapping")
-                return self.simple_position_mapping(x, y, z, roll, pitch, yaw, gripper_closed)
-        else:
-            return self.simple_position_mapping(x, y, z, roll, pitch, yaw, gripper_closed)
-
-    def simple_position_mapping(self, x: float, y: float, z: float,
-                               roll: float, pitch: float, yaw: float, gripper_closed: bool = False) -> Dict[str, float]:
+    def incremental_ik_control(self, joystick_x: float = 0.0, joystick_y: float = 0.0,
+                              pitch: float = 0.0, roll: float = 0.0, gripper_closed: bool = False) -> Dict[str, float]:
         """
-        Joystick-style position mapping using simplified inverse kinematics.
+        Incremental IK control exactly like keyboard_teleop.
 
-        Joystick Mode:
-        - Phone X position (left/right tilt) -> End-effector X position
-        - Phone Y position (forward/back tilt) -> End-effector Y position
-        - Phone Z position (twist) -> End-effector Z position
-        - Wrist orientation remains neutral for stability
+        Joystick mapping:
+        - X axis (left/right) -> Y movement in end-effector space (like 'a'/'d' keys)
+        - Y axis (forward/back) -> X movement in end-effector space (like 'w'/'s' keys)
+        - Phone pitch -> wrist_flex (when joystick not active)
+        - Phone roll -> wrist_roll (always)
 
         Args:
-            x, y, z: Target position in robot workspace (meters)
-            roll, pitch, yaw: Phone orientation (used for wrist if needed)
+            joystick_x, joystick_y: Normalized joystick position (-1 to 1)
+            pitch, roll: Phone orientation in radians
             gripper_closed: Gripper state
 
         Returns:
             Dictionary of joint positions in normalized range
         """
-        # Clamp positions to workspace limits
-        x_clamped = np.clip(x, self.workspace_limits['x'][0], self.workspace_limits['x'][1])
-        y_clamped = np.clip(y, self.workspace_limits['y'][0], self.workspace_limits['y'][1])
-        z_clamped = np.clip(z, self.workspace_limits['z'][0], self.workspace_limits['z'][1])
 
-        # Simple geometric IK approximation for SO101 arm
+        if not HAS_KEYBOARD_IK:
+            logger.warning("Keyboard IK not available, using fallback")
+            return self.fallback_control(joystick_x, joystick_y, pitch, roll, gripper_closed)
+
+        # Movement deltas based on joystick (same logic as keyboard_teleop)
+        movement = {
+            'x': joystick_y * self.step_size,   # Forward/back from joystick Y
+            'y': -joystick_x * self.step_size,  # Left/right from joystick X (negative to fix direction)
+            'z': 0.0  # No Z control from joystick
+        }
+
+        # Debug logging
+        if abs(joystick_x) > 0.01 or abs(joystick_y) > 0.01:
+            logger.info(f"Joystick input: x={joystick_x:.3f}, y={joystick_y:.3f}")
+            logger.info(f"Movement delta: x={movement['x']:.6f}, y={movement['y']:.6f}")
+            logger.info(f"EF position: {self.ef_position}")
+
+        # Update end-effector position incrementally (like keyboard_teleop)
+        self.ef_position[0] += movement['x']
+        self.ef_position[1] += movement['y']
+        self.ef_position[2] += movement['z']
+
+        # Clamp to workspace limits
+        self.ef_position[0] = np.clip(self.ef_position[0], 0.05, 0.35)
+        self.ef_position[1] = np.clip(self.ef_position[1], -0.25, 0.25)
+        self.ef_position[2] = np.clip(self.ef_position[2], 0.05, 0.3)
+
+        try:
+            # Compute IK with current angles as seed (like keyboard_teleop)
+            updated_angles = iterative_ik(
+                self.ef_position,
+                self.ef_pitch,
+                self.current_angles,
+                max_iter=100,
+                alpha=0.5
+            )
+
+            # Check for sudden jumps (safety check from keyboard_teleop)
+            max_angle_change = 30  # degrees
+            angle_changes = np.abs(np.array(updated_angles) - np.array(self.current_angles))
+
+            if np.all(angle_changes < max_angle_change):
+                self.current_angles = list(updated_angles)
+                logger.debug(f"IK solved: EF pos={self.ef_position}, angles={self.current_angles}")
+            else:
+                logger.warning("IK jump detected, keeping previous angles")
+
+        except Exception as e:
+            logger.warning(f"IK computation failed: {e}")
+
+        # Convert angles to servo positions (-100 to 100 range)
         joint_positions = {}
 
-        # Calculate joint angles using basic geometric relationships
-        # This is a simplified IK - real IK would be more complex
+        # Map 4 main joints from IK solution
+        # Note: These mappings may need adjustment based on your specific robot calibration
+        joint_positions["shoulder_pan.pos"] = float(np.clip(self.current_angles[0] * 100/180, -100, 100))
+        joint_positions["shoulder_lift.pos"] = float(np.clip(self.current_angles[1] * 100/180, -100, 100))
+        joint_positions["elbow_flex.pos"] = float(np.clip(self.current_angles[2] * 100/180, -100, 100))
 
-        # Shoulder pan (base rotation) - maps to X position
-        shoulder_pan_rad = np.arctan2(x_clamped, y_clamped)
-        shoulder_pan_deg = np.degrees(shoulder_pan_rad)
-        shoulder_pan_norm = np.clip(shoulder_pan_deg * 1.5, -100, 100)
-        joint_positions["shoulder_pan.pos"] = float(shoulder_pan_norm)
+        # Wrist flex: IK result when joystick active, phone pitch when inactive
+        joystick_active = abs(joystick_x) > 0.05 or abs(joystick_y) > 0.05
+        if joystick_active:
+            joint_positions["wrist_flex.pos"] = float(np.clip(self.current_angles[3] * 100/180, -100, 100))
+        else:
+            # Use phone pitch for wrist control when joystick is centered
+            # Invert pitch direction: forward tilt (positive pitch) -> negative wrist_flex (down)
+            wrist_flex = np.clip(np.degrees(pitch) * 2, -100, 100)  # Removed negative sign to fix direction
+            joint_positions["wrist_flex.pos"] = float(wrist_flex)
 
-        # Distance from base
-        r = np.sqrt(x_clamped**2 + y_clamped**2)
+        # Wrist roll: Always controlled by phone roll (NOT linked to joystick as requested)
+        wrist_roll = np.clip(np.degrees(roll) * 2, -100, 100)
+        joint_positions["wrist_roll.pos"] = float(wrist_roll)
 
-        # Shoulder lift - affects Y position and height
-        target_reach = np.sqrt(r**2 + (z_clamped - 0.1)**2)  # Offset for base height
-        shoulder_lift_rad = np.arctan2(z_clamped - 0.1, r) + np.arccos(np.clip(target_reach / 0.6, 0, 1))
-        shoulder_lift_deg = np.degrees(shoulder_lift_rad) - 90  # Offset for neutral position
-        shoulder_lift_norm = np.clip(shoulder_lift_deg * 2, -100, 100)
-        joint_positions["shoulder_lift.pos"] = float(shoulder_lift_norm)
+        # Gripper
+        joint_positions["gripper.pos"] = 100.0 if gripper_closed else 0.0
 
-        # Elbow flex - compensates for shoulder to maintain end-effector position
-        elbow_angle_rad = np.pi - 2 * np.arccos(np.clip(target_reach / 0.6, 0, 1))
-        elbow_angle_deg = np.degrees(elbow_angle_rad)
-        elbow_flex_norm = np.clip((elbow_angle_deg - 120) * 1.5, -100, 100)
-        joint_positions["elbow_flex.pos"] = float(elbow_flex_norm)
+        return joint_positions
 
-        # Wrist flex - keep relatively neutral for stability (slight downward angle)
-        wrist_flex_norm = -20.0  # Slight downward angle
-        joint_positions["wrist_flex.pos"] = float(wrist_flex_norm)
+    def fallback_control(self, joystick_x: float, joystick_y: float,
+                        pitch: float, roll: float, gripper_closed: bool) -> Dict[str, float]:
+        """Fallback control when IK not available"""
+        joint_positions = {}
 
-        # Wrist roll - keep neutral for joystick mode
-        wrist_roll_norm = 0.0
-        joint_positions["wrist_roll.pos"] = float(wrist_roll_norm)
-
-        # Gripper: controlled by phone button
+        # Simple direct mapping
+        joint_positions["shoulder_pan.pos"] = float(np.clip(-joystick_x * 50, -100, 100))
+        joint_positions["shoulder_lift.pos"] = float(np.clip(joystick_y * 50, -100, 100))
+        joint_positions["elbow_flex.pos"] = float(np.clip(-joystick_y * 30, -100, 100))
+        joint_positions["wrist_flex.pos"] = float(np.clip(np.degrees(pitch) * 2, -100, 100))  # Fixed direction
+        joint_positions["wrist_roll.pos"] = float(np.clip(np.degrees(roll) * 2, -100, 100))
         joint_positions["gripper.pos"] = 100.0 if gripper_closed else 0.0
 
         return joint_positions

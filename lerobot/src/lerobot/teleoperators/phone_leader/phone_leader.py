@@ -54,6 +54,31 @@ class PhoneLeader(Teleoperator):
         self._prev_action: Dict[str, float] | None = None
         self._deadband = 1.0
 
+        # Simple 1D Kalman filters for orientation and velocity (per-axis)
+        # x_k = x_{k-1}  (random walk); update with measurement z
+        class _KF:
+            def __init__(self, q=0.5, r=4.0, x0=0.0):  # process and measurement noise (deg^2)
+                self.q = float(q)
+                self.r = float(r)
+                self.x = float(x0)
+                self.p = 1.0
+            def update(self, z):
+                # predict
+                self.p = self.p + self.q
+                # update
+                k = self.p / (self.p + self.r)
+                self.x = self.x + k * (float(z) - self.x)
+                self.p = (1.0 - k) * self.p
+                return self.x
+
+        self._kf_yaw = _KF(q=0.5, r=8.0)
+        self._kf_pitch = _KF(q=0.5, r=8.0)
+        self._kf_roll = _KF(q=0.5, r=8.0)
+        # velocities are slider-controlled; still lightly filter to avoid jitter
+        self._kf_vx = _KF(q=0.05, r=0.5)
+        self._kf_vy = _KF(q=0.05, r=0.5)
+        self._kf_vz = _KF(q=0.05, r=0.5)
+
     @property
     def action_features(self) -> dict[str, type]:
         return {
@@ -121,12 +146,12 @@ class PhoneLeader(Teleoperator):
         self._last_t = now
 
         data = self.ipc.get()
-        yaw = float(data.get("yaw", 0.0))
-        pitch = float(data.get("pitch", 0.0))
-        roll = float(data.get("roll", 0.0))
-        vx = float(data.get("vx", 0.0))
-        vy = float(data.get("vy", 0.0))
-        vz = float(data.get("vz", 0.0))
+        yaw = self._kf_yaw.update(data.get("yaw", 0.0))
+        pitch = self._kf_pitch.update(data.get("pitch", 0.0))
+        roll = self._kf_roll.update(data.get("roll", 0.0))
+        vx = self._kf_vx.update(data.get("vx", 0.0))
+        vy = self._kf_vy.update(data.get("vy", 0.0))
+        vz = self._kf_vz.update(data.get("vz", 0.0))
         grip = float(data.get("gripper", 50.0))
 
         # Integrate velocity into target position
@@ -184,4 +209,3 @@ class PhoneLeader(Teleoperator):
                     action[k] = prev
         self._prev_action = dict(action)
         return action
-

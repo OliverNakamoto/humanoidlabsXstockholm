@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ngrok config:*)",
+      "Bash(where ngrok)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
