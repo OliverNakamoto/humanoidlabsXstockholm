@@ -99,15 +99,19 @@ class HandLeaderIPC(Teleoperator):
             'z_min': 0.10, 'z_max': 0.40   # 10cm to 40cm height
         }
 
-        # Test actual robot reach using URDF (if kinematics available)
-        if self.kinematics is not None:
-            logger.info("🔍 Testing actual robot reach using URDF...")
-            actual_bounds = self._test_robot_reach()
-            logger.info(f"📊 URDF-based workspace bounds: {actual_bounds}")
-            logger.info(f"📊 Current workspace bounds:    {self.workspace_bounds}")
+        # Initialize live workspace mapping variables
+        self._workspace_mapping_active = False
+        self._mapped_positions = []
+        self._mapping_bounds = {
+            'x_min': float('inf'), 'x_max': float('-inf'),
+            'y_min': float('inf'), 'y_max': float('-inf'),
+            'z_min': float('inf'), 'z_max': float('-inf')
+        }
 
-            # Compare and warn about mismatches
-            self._compare_workspace_bounds(actual_bounds)
+        # Configuration for startup workspace mapping
+        self.enable_startup_mapping = getattr(config, 'enable_startup_mapping', True)
+        self.startup_mapping_duration = getattr(config, 'startup_mapping_duration', 60)
+        self._robot_instance = None  # Will be set by teleoperation system
 
         self._is_connected = False
 
@@ -171,7 +175,15 @@ class HandLeaderIPC(Teleoperator):
             
             self._is_connected = True
             logger.info(f"{self} connected successfully - calibration complete")
-            
+
+            # Run automatic workspace mapping if enabled and kinematics available
+            if self.enable_startup_mapping and self.kinematics is not None:
+                logger.info("🗺️ AUTOMATIC WORKSPACE MAPPING ENABLED")
+                self._run_startup_workspace_mapping()
+            elif self.enable_startup_mapping and self.kinematics is None:
+                logger.warning("⚠️  Workspace mapping disabled: No URDF/kinematics available")
+                logger.info("💡 Add --teleop.urdf_path to enable workspace mapping")
+
         except Exception as e:
             logger.error(f"Failed to connect: {e}")
             self._cleanup_on_failure()
@@ -607,105 +619,317 @@ class HandLeaderIPC(Teleoperator):
         logger.info(f"📤 FIXED POSITION SIMPLE OUTPUT: {actions}")
         return actions
 
-    def _test_robot_reach(self) -> dict:
+    def start_live_workspace_mapping(self, duration_seconds=60):
         """
-        Test the actual reach limits of the robot using URDF forward kinematics.
+        Start live workspace mapping by tracking robot positions as user moves it.
 
-        Returns:
-            Dictionary with actual workspace bounds based on joint limits
+        Args:
+            duration_seconds: How long to run the mapping session (0 = manual stop)
         """
         if self.kinematics is None:
-            return self.workspace_bounds
+            logger.error("❌ Cannot start live mapping: No kinematics solver available")
+            logger.info("💡 Add --teleop.urdf_path to your command to enable live mapping")
+            return False
 
-        joint_names = getattr(self.config, 'joint_names', [
-            "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"
-        ])
+        if not self.is_connected:
+            logger.error("❌ Cannot start live mapping: Robot not connected")
+            return False
 
-        # Test points by exploring joint limit combinations
-        test_positions = []
+        logger.info("🚀 STARTING LIVE WORKSPACE MAPPING")
+        logger.info("="*60)
+        logger.info("📋 Instructions:")
+        logger.info("   • Move the robot arm to explore its full workspace")
+        logger.info("   • Reach as far as safely possible in all directions:")
+        logger.info("     - Forward/backward (X-axis)")
+        logger.info("     - Left/right (Y-axis)")
+        logger.info("     - Up/down (Z-axis)")
+        logger.info("   • Press Ctrl+C to stop mapping early")
+        logger.info(f"   • Mapping will run for {duration_seconds}s if not stopped")
+        logger.info("="*60)
 
-        logger.info("🔍 Testing robot reach at joint limits...")
+        # Disable torque on the robot motors so they can be moved manually
+        try:
+            if hasattr(self._robot_instance, 'bus') and hasattr(self._robot_instance.bus, 'disable_torque'):
+                logger.info("🔓 Disabling motor torque for manual movement...")
+                self._robot_instance.bus.disable_torque()
+                time.sleep(0.5)  # Give motors time to release
+                logger.info("✅ Motors are now free to move manually")
+            else:
+                logger.warning("⚠️  Could not find disable_torque method on robot")
+        except Exception as e:
+            logger.warning(f"Could not disable torque: {e}")
+            logger.info("⚠️  Motors may still be powered - be careful when moving the arm")
 
-        # Test different joint configurations to find workspace bounds
-        test_configs = [
-            # [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll]
-
-            # Maximum forward reach
-            [0, -90, -90, 0, 0],    # Shoulder down, elbow extended
-            [0, 45, -45, 0, 0],     # Shoulder up, elbow extended
-
-            # Maximum left/right reach
-            [90, 0, -45, 0, 0],     # Pan right, elbow extended
-            [-90, 0, -45, 0, 0],    # Pan left, elbow extended
-            [90, -45, -90, 0, 0],   # Pan right, shoulder down, elbow extended
-            [-90, -45, -90, 0, 0],  # Pan left, shoulder down, elbow extended
-
-            # Maximum up reach
-            [0, 90, 45, -45, 0],    # Shoulder up, elbow up
-            [0, 90, 90, -90, 0],    # Shoulder up, elbow fully up
-
-            # Maximum down reach
-            [0, -90, 90, 90, 0],    # Shoulder down, elbow down
-            [0, -45, -90, 45, 0],   # Shoulder mid-down, elbow extended
-
-            # Corner positions
-            [90, 90, 45, -45, 0],   # Right-up
-            [-90, 90, 45, -45, 0],  # Left-up
-            [90, -90, -90, 0, 0],   # Right-down-forward
-            [-90, -90, -90, 0, 0],  # Left-down-forward
-
-            # Additional test positions
-            [45, 0, -90, 0, 0],     # Mid-right, extended
-            [-45, 0, -90, 0, 0],    # Mid-left, extended
-            [0, 0, -90, 0, 0],      # Center, extended
-            [0, 0, 0, 0, 0],        # Center, neutral
-        ]
-
-        for config in test_configs:
-            try:
-                # Clamp joint angles to defined limits
-                clamped_config = []
-                for i, (joint_name, angle) in enumerate(zip(joint_names, config)):
-                    if i < len(config):
-                        min_deg, max_deg = self.joint_limits.get(joint_name, (-90, 90))
-                        clamped_angle = np.clip(angle, min_deg, max_deg)
-                        clamped_config.append(clamped_angle)
-
-                # Use forward kinematics to get end effector position
-                pose_matrix = self.kinematics.forward_kinematics(np.array(clamped_config))
-
-                # Extract position (x, y, z) from transformation matrix
-                x, y, z = pose_matrix[0, 3], pose_matrix[1, 3], pose_matrix[2, 3]
-                test_positions.append((x, y, z))
-
-                logger.debug(f"Config {clamped_config} → Position ({x:.3f}, {y:.3f}, {z:.3f})")
-
-            except Exception as e:
-                logger.debug(f"Failed to test config {config}: {e}")
-                continue
-
-        if not test_positions:
-            logger.warning("Could not determine workspace bounds from URDF")
-            return self.workspace_bounds
-
-        # Calculate actual workspace bounds from test positions
-        xs, ys, zs = zip(*test_positions)
-
-        actual_bounds = {
-            'x_min': float(np.min(xs)),
-            'x_max': float(np.max(xs)),
-            'y_min': float(np.min(ys)),
-            'y_max': float(np.max(ys)),
-            'z_min': float(np.min(zs)),
-            'z_max': float(np.max(zs))
+        # Reset mapping data
+        self._workspace_mapping_active = True
+        self._mapped_positions = []
+        self._mapping_bounds = {
+            'x_min': float('inf'), 'x_max': float('-inf'),
+            'y_min': float('inf'), 'y_max': float('-inf'),
+            'z_min': float('inf'), 'z_max': float('-inf')
         }
 
-        logger.info(f"✅ Tested {len(test_positions)} robot configurations")
-        logger.info(f"📏 X range: {actual_bounds['x_min']:.3f}m to {actual_bounds['x_max']:.3f}m (span: {actual_bounds['x_max']-actual_bounds['x_min']:.3f}m)")
-        logger.info(f"📏 Y range: {actual_bounds['y_min']:.3f}m to {actual_bounds['y_max']:.3f}m (span: {actual_bounds['y_max']-actual_bounds['y_min']:.3f}m)")
-        logger.info(f"📏 Z range: {actual_bounds['z_min']:.3f}m to {actual_bounds['z_max']:.3f}m (span: {actual_bounds['z_max']-actual_bounds['z_min']:.3f}m)")
+        import threading
+        import time
 
-        return actual_bounds
+        start_time = time.time()
+        last_display_time = 0
+        sample_count = 0
+        display_interval = 2.0  # Display update every 2 seconds
+
+        # try:
+        logger.info("tessthsi")
+
+        while self._workspace_mapping_active:
+            current_time = time.time()
+            elapsed_time = current_time - start_time
+
+            # Stop if duration exceeded
+            if duration_seconds > 0 and elapsed_time >= duration_seconds:
+                logger.info("⏰ Mapping duration reached, stopping...")
+                break
+
+            # Get current robot position (same way as teleoperation loop)
+            if self._robot_instance and hasattr(self._robot_instance, 'get_pos'):
+                # Read current robot position directly - just like teleop_loop does
+                current_pos = self._robot_instance.get_pos()
+                logger.info(f"Current robot position: {current_pos}")
+
+                if current_pos:
+                    # Convert robot joint positions to end effector position using forward kinematics
+                    ee_position = self._calculate_end_effector_position_from_robot_pos(current_pos)
+
+                    # if ee_position:
+                    #     # Update boundaries
+                    #     self._update_mapping_bounds(ee_position)
+                    #     sample_count += 1
+                    #     logger.debug(f"Mapped position: {ee_position}")
+                    # else:
+                    #     logger.debug("Failed to calculate end effector position")
+                else:
+                    logger.debug("robot.get_pos() returned None")
+            else:
+                logger.debug("No robot instance available")
+
+            # except Exception as e:
+            #     logger.debug(f"Failed to read robot position: {e}")
+
+            # Display progress periodically
+            if current_time - last_display_time >= display_interval:
+                self._display_mapping_progress(elapsed_time, duration_seconds, sample_count)
+                last_display_time = current_time
+
+            time.sleep(0.5)  # 2 Hz sampling rate
+
+        # except KeyboardInterrupt:
+        #     logger.info("\n🛑 Mapping stopped by user")
+
+        # Finish mapping
+        self._workspace_mapping_active = False
+
+        # Re-enable torque on the robot motors
+        try:
+            if hasattr(self._robot_instance, 'bus') and hasattr(self._robot_instance.bus, 'enable_torque'):
+                logger.info("🔒 Re-enabling motor torque...")
+                self._robot_instance.bus.enable_torque()
+                time.sleep(0.5)  # Give motors time to engage
+        except Exception as e:
+            logger.warning(f"Could not re-enable torque: {e}")
+
+        final_bounds = self._finalize_workspace_mapping(sample_count)
+
+        logger.info("✅ Live workspace mapping completed!")
+        return final_bounds
+
+    def stop_live_workspace_mapping(self):
+        """Stop the live workspace mapping session."""
+        self._workspace_mapping_active = False
+        logger.info("🛑 Stopping live workspace mapping...")
+
+    def _get_current_robot_position(self):
+        """Get current robot joint positions from the robot instance or last known position."""
+        try:
+            # Method 1: Read directly from robot instance if available
+            if self._robot_instance and hasattr(self._robot_instance, 'get_pos'):
+                try:
+                    robot_pos = self._robot_instance.get_pos()
+                    if robot_pos:
+                        # Extract joint positions in order
+                        joint_names = getattr(self.config, 'joint_names', [
+                            "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"
+                        ])
+
+                        joint_positions = []
+                        for joint_name in joint_names:
+                            key = f"{joint_name}.pos"
+                            if key in robot_pos:
+                                joint_positions.append(robot_pos[key])
+                            else:
+                                joint_positions.append(0.0)  # Default if missing
+
+                        return joint_positions
+                except Exception as e:
+                    logger.debug(f"Failed to read from robot instance: {e}")
+
+            # Method 2: Use last known position from get_action()
+            if hasattr(self, '_last_current_pos') and self._last_current_pos:
+                # Extract joint positions in order
+                joint_names = getattr(self.config, 'joint_names', [
+                    "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"
+                ])
+
+                joint_positions = []
+                for joint_name in joint_names:
+                    key = f"{joint_name}.pos"
+                    if key in self._last_current_pos:
+                        joint_positions.append(self._last_current_pos[key])
+                    else:
+                        joint_positions.append(0.0)  # Default if missing
+
+                return joint_positions
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"Failed to get current robot position: {e}")
+            return None
+
+    def _calculate_end_effector_position(self, joint_positions):
+        """Calculate end effector position from joint positions using forward kinematics."""
+        try:
+            joint_names = getattr(self.config, 'joint_names', [
+                "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"
+            ])
+
+            # Convert normalized positions to degrees
+            joint_angles_deg = []
+            for i, joint_name in enumerate(joint_names):
+                if i < len(joint_positions):
+                    norm_val = joint_positions[i]
+                    min_deg, max_deg = self.joint_limits.get(joint_name, (-90, 90))
+                    deg_val = min_deg + (norm_val + 100) * (max_deg - min_deg) / 200
+                    joint_angles_deg.append(deg_val)
+
+            # Use forward kinematics
+            pose_matrix = self.kinematics.forward_kinematics(np.array(joint_angles_deg))
+            x, y, z = pose_matrix[0, 3], pose_matrix[1, 3], pose_matrix[2, 3]
+
+            return (x, y, z)
+
+        except Exception as e:
+            logger.debug(f"Failed to calculate end effector position: {e}")
+            return None
+
+    def _calculate_end_effector_position_from_robot_pos(self, robot_pos):
+        """Calculate end effector position from robot position dict (same format as robot.get_pos())."""
+        try:
+            if not self.kinematics:
+                logger.error("Kinematics not initialized - check URDF path")
+                return 1/0
+            joint_names = getattr(self.config, 'joint_names', [
+                "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"
+            ])
+
+            # Extract joint angles from robot position dict
+            joint_angles_deg = []
+            for joint_name in joint_names:
+                key = f"{joint_name}.pos"
+                if key in robot_pos:
+                    norm_val = robot_pos[key]  # Robot returns normalized [-100, 100] values
+                    min_deg, max_deg = self.joint_limits.get(joint_name, (-90, 90))
+                    # Convert normalized value to degrees
+                    deg_val = min_deg + (norm_val + 100) * (max_deg - min_deg) / 200
+                    joint_angles_deg.append(deg_val)
+                    logger.info(f"{joint_name}: norm={norm_val:.1f} -> deg={deg_val:.1f}")
+                else:
+                    logger.info(f"Missing joint {key} in robot position")
+                    joint_angles_deg.append(0.0)  # Default
+
+            # Use forward kinematics
+            pose_matrix = self.kinematics.forward_kinematics(np.array(joint_angles_deg))
+            x, y, z = pose_matrix[0, 3], pose_matrix[1, 3], pose_matrix[2, 3]
+
+            logger.info(f"Forward kinematics: joints={joint_angles_deg} -> pos=({x:.3f}, {y:.3f}, {z:.3f})")
+            return (x, y, z)
+
+        except Exception as e:
+            logger.error(f"Failed to calculate end effector position from robot pos: {e}")
+            return None
+
+    def _update_mapping_bounds(self, position):
+        """Update the running workspace boundaries with new position."""
+        x, y, z = position
+
+        # Validate position is reasonable (basic sanity check)
+        if abs(x) > 2.0 or abs(y) > 2.0 or abs(z) > 2.0:
+            logger.debug(f"Ignoring outlier position: ({x:.3f}, {y:.3f}, {z:.3f})")
+            return
+
+        # Update boundaries
+        self._mapping_bounds['x_min'] = min(self._mapping_bounds['x_min'], x)
+        self._mapping_bounds['x_max'] = max(self._mapping_bounds['x_max'], x)
+        self._mapping_bounds['y_min'] = min(self._mapping_bounds['y_min'], y)
+        self._mapping_bounds['y_max'] = max(self._mapping_bounds['y_max'], y)
+        self._mapping_bounds['z_min'] = min(self._mapping_bounds['z_min'], z)
+        self._mapping_bounds['z_max'] = max(self._mapping_bounds['z_max'], z)
+
+        # Store position for analysis
+        self._mapped_positions.append((x, y, z))
+
+    def _display_mapping_progress(self, elapsed_time, duration_seconds, sample_count):
+        """Display current mapping progress."""
+        bounds = self._mapping_bounds
+
+        # Handle case where no valid positions recorded yet
+        if bounds['x_min'] == float('inf'):
+            logger.info(f"⏱️  Mapping progress: {elapsed_time:.1f}s - No valid positions recorded yet")
+            return
+
+        time_str = f"{elapsed_time:.1f}s"
+        if duration_seconds > 0:
+            time_str += f"/{duration_seconds}s"
+
+        logger.info(f"⏱️  LIVE WORKSPACE MAPPING ({time_str}) - Samples: {sample_count}")
+        logger.info(f"📏 X: {bounds['x_min']:.3f}m to {bounds['x_max']:.3f}m (span: {bounds['x_max']-bounds['x_min']:.3f}m)")
+        logger.info(f"📏 Y: {bounds['y_min']:.3f}m to {bounds['y_max']:.3f}m (span: {bounds['y_max']-bounds['y_min']:.3f}m)")
+        logger.info(f"📏 Z: {bounds['z_min']:.3f}m to {bounds['z_max']:.3f}m (span: {bounds['z_max']-bounds['z_min']:.3f}m)")
+
+    def _finalize_workspace_mapping(self, sample_count):
+        """Finalize workspace mapping and return results."""
+        bounds = self._mapping_bounds
+
+        if sample_count == 0 or bounds['x_min'] == float('inf'):
+            logger.warning("❌ No valid positions recorded during mapping")
+            return self.workspace_bounds
+
+        logger.info("="*60)
+        logger.info("📊 FINAL WORKSPACE MAPPING RESULTS")
+        logger.info(f"✅ Recorded {sample_count} valid positions")
+        logger.info(f"📏 X range: {bounds['x_min']:.3f}m to {bounds['x_max']:.3f}m (span: {bounds['x_max']-bounds['x_min']:.3f}m)")
+        logger.info(f"📏 Y range: {bounds['y_min']:.3f}m to {bounds['y_max']:.3f}m (span: {bounds['y_max']-bounds['y_min']:.3f}m)")
+        logger.info(f"📏 Z range: {bounds['z_min']:.3f}m to {bounds['z_max']:.3f}m (span: {bounds['z_max']-bounds['z_min']:.3f}m)")
+
+        # Add safety margin
+        safety_margin = 0.02  # 2cm
+        safe_bounds = {
+            'x_min': bounds['x_min'] + safety_margin,
+            'x_max': bounds['x_max'] - safety_margin,
+            'y_min': bounds['y_min'] + safety_margin,
+            'y_max': bounds['y_max'] - safety_margin,
+            'z_min': max(bounds['z_min'] + safety_margin, 0.05),  # At least 5cm above ground
+            'z_max': bounds['z_max'] - safety_margin,
+        }
+
+        logger.info("💡 SUGGESTED workspace bounds (with 2cm safety margin):")
+        logger.info(f"   x_min: {safe_bounds['x_min']:.3f}, x_max: {safe_bounds['x_max']:.3f}")
+        logger.info(f"   y_min: {safe_bounds['y_min']:.3f}, y_max: {safe_bounds['y_max']:.3f}")
+        logger.info(f"   z_min: {safe_bounds['z_min']:.3f}, z_max: {safe_bounds['z_max']:.3f}")
+        logger.info("="*60)
+
+        # Compare with current bounds
+        self._compare_workspace_bounds(bounds)
+
+        return safe_bounds
 
     def _compare_workspace_bounds(self, actual_bounds: dict):
         """Compare actual URDF-based bounds with configured bounds and warn about issues."""
@@ -787,9 +1011,91 @@ class HandLeaderIPC(Teleoperator):
             'process_manager_info': self.process_manager.get_process_info() if self.process_manager else {},
             'ipc_client_stats': {}
         }
-        
+
         client = self.client_manager.get_client()
         if client:
             stats['ipc_client_stats'] = client.get_connection_stats()
-        
+
         return stats
+
+    def map_workspace_live(self, duration_seconds=60):
+        """
+        Convenience method to start live workspace mapping.
+
+        Usage:
+            teleop.map_workspace_live(60)  # Map for 60 seconds
+            teleop.map_workspace_live(0)   # Map until Ctrl+C
+
+        Args:
+            duration_seconds: Mapping duration (0 = manual stop)
+
+        Returns:
+            Dictionary with measured workspace bounds
+        """
+        return self.start_live_workspace_mapping(duration_seconds)
+
+    def _run_startup_workspace_mapping(self):
+        """Run automatic workspace mapping at startup."""
+        logger.info("")
+        logger.info("🚀 STARTING AUTOMATIC WORKSPACE MAPPING")
+        logger.info("="*60)
+        logger.info("📋 INSTRUCTIONS:")
+        logger.info("   🎮 Use your hand tracking or leader arm to move the robot")
+        logger.info("   📐 Explore the robot's full workspace:")
+        logger.info("     • Move as far FORWARD/BACKWARD as safely possible")
+        logger.info("     • Move as far LEFT/RIGHT as safely possible")
+        logger.info("     • Move as HIGH/LOW as safely possible")
+        logger.info("   ⏱️  You have {} seconds to explore".format(self.startup_mapping_duration))
+        logger.info("   🛑 Press Ctrl+C to stop mapping early")
+        logger.info("   📊 Real-time boundaries will be displayed")
+        logger.info("="*60)
+        logger.info("")
+
+        # try:
+        # Wait a moment for user to read instructions
+        import time
+        logger.info("⏳ Starting workspace mapping in 3 seconds...")
+        time.sleep(1)
+        logger.info("⏳ 2...")
+        time.sleep(1)
+        logger.info("⏳ 1...")
+        time.sleep(1)
+        logger.info("🟢 GO! Move the robot to map workspace!")
+        logger.info("")
+
+        # Run the live mapping
+        mapped_bounds = self.start_live_workspace_mapping(self.startup_mapping_duration)
+
+        if mapped_bounds and mapped_bounds != self.workspace_bounds:
+            logger.info("")
+            logger.info("🔄 UPDATING WORKSPACE BOUNDS")
+            logger.info(f"   Old bounds: {self.workspace_bounds}")
+            logger.info(f"   New bounds: {mapped_bounds}")
+
+            # Update the workspace bounds with the mapped results
+            self.workspace_bounds.update(mapped_bounds)
+
+            logger.info("✅ Workspace bounds updated for this session!")
+            logger.info("💡 Consider adding these bounds to your configuration")
+        else:
+            logger.info("ℹ️  No workspace bounds changes needed")
+
+        # except KeyboardInterrupt:
+        #     logger.info("")
+        #     logger.info("🛑 Startup workspace mapping interrupted by user")
+        #     logger.info("   Exiting teleoperation...")
+        #     # Re-raise KeyboardInterrupt to exit the entire program
+        #     raise
+
+        # except Exception as e:
+        #     logger.error(f"❌ Startup workspace mapping failed: {e}")
+        #     logger.info("   Continuing with default workspace bounds...")
+
+        logger.info("")
+        logger.info("🎯 STARTING NORMAL TELEOPERATION")
+        logger.info("="*60)
+        logger.info("")
+
+    def set_robot_instance(self, robot):
+        """Set the robot instance for position reading during mapping."""
+        self._robot_instance = robot

@@ -72,7 +72,7 @@ from lerobot.robots import (  # noqa: F401
     so101_follower,
 )
 # Import mock robot for testing
-from tests.mocks.mock_so101_robot import MockSO101Robot, MockSO101Config  # noqa: F401
+# Note: Mock robot import removed to avoid import issues
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -143,8 +143,15 @@ def teleoperate(cfg: TeleoperateConfig):
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
 
-    teleop.connect()  # This will wait for calibration to complete
+    # Pass robot instance to teleoperator if it supports workspace mapping
+    if hasattr(teleop, 'set_robot_instance'):
+        teleop.set_robot_instance(robot)
+
+    # Connect robot FIRST so it's available for workspace mapping
     robot.connect()
+
+    # Then connect teleoperator (which includes workspace mapping)
+    teleop.connect()  # This will wait for calibration to complete
 
     # Initialize Rerun after teleop connection (and calibration) is complete
     if cfg.display_data:

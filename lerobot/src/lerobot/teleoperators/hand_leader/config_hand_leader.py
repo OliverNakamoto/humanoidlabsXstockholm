@@ -73,3 +73,7 @@ class HandLeaderIPCConfig(TeleoperatorConfig):
     
     # Whether to show the live tracking visualization window
     show_window: bool = False
+
+    # Workspace mapping configuration
+    enable_startup_mapping: bool = True  # Run workspace mapping at startup
+    startup_mapping_duration: int = 300   # Duration in seconds for startup mapping
